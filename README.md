@@ -10,6 +10,7 @@ Paste a video-page URL, pick a quality, download it, then stream it or save it t
   - `POST /api/download` — starts a download job (max 2 at once, extras queue).
   - `GET /api/jobs/:id` — poll for progress (percent, speed, ETA).
   - `GET /api/files` / `GET /api/file/:name` / `DELETE /api/file/:name` — manage completed downloads.
+  - `GET /api/settings` / `POST /api/settings` — view or change the save folder from the UI (Library → Change). Persists to `config.json`.
 - Guards: only http(s) URLs, `--no-playlist` always, 2 GB max file size, 2 concurrent downloads, filenames restricted to safe characters, files auto-deleted after 24h (Railway disk is ephemeral anyway).
 - **Deep fetch** (`deepfetch.js`, Playwright + headless Chromium) — for JS-heavy streaming sites yt-dlp can't read. The frontend offers "Try deep fetch" automatically when `/api/info` reports an unsupported URL:
   - `POST /api/deep-info` — opens the page in a real headless browser, sniffs network traffic for `.m3u8`/`.mp4` streams, checks `<video>` tags, and tries one click-to-play if nothing shows up yet. Returns candidate streams.
@@ -25,25 +26,34 @@ pip install -r requirements.txt   # needs python3 + ffmpeg on PATH
 node server.js                     # listens on $PORT (default 3000)
 ```
 
-## Run on your laptop
+## Run on your Windows laptop (no hosting needed)
 
-Same app, no Railway needed — useful if you want files to land straight on an
-external drive instead of Railway's ephemeral disk:
+You don't need Railway at all. The app runs on your laptop exactly like
+MediaDash, and videos save straight to your E drive.
 
-```bash
-# Windows (cmd)
-set DOWNLOAD_DIR=E:\videos && node server.js
+**First time (one click):**
 
-# macOS / Linux
-DOWNLOAD_DIR=/path/to/videos node server.js
-```
+1. Clone the repo somewhere on your laptop, e.g. `C:\apps\video-downloader`
+   (or download the ZIP from GitHub and extract it).
+2. Double-click **`setup-windows.bat`**. It installs the Node packages,
+   downloads `yt-dlp.exe` + `ffmpeg.exe`/`ffprobe.exe` into `bin\` (no Python
+   install needed), and installs the headless Chromium browser used by deep
+   fetch. No admin rights needed — everything lives inside the project folder.
 
-Then open it from your phone like MediaDash: find your laptop's LAN IP
-(`ipconfig` on Windows, look for IPv4 Address) and browse to
-`http://<LAN-IP>:3000` on the same WiFi. Keep the laptop awake and Node
-running while you download. `DOWNLOAD_DIR` controls everything — yt-dlp
-output, deep-fetch downloads, the Library listing, and the 24h auto-sweep.
-Unset, it falls back to `./downloads` next to `server.js`.
+**Every time after that:**
+
+1. Double-click **`start-windows.bat`**.
+2. On the laptop open `http://localhost:3000`.
+3. On your phone (same WiFi) open `http://<your-laptop-IP>:3000` — find the IP
+   with `ipconfig` (look for IPv4 Address), same as MediaDash.
+4. Keep the laptop awake and the window open while you download.
+
+**Where files go:** `E:\video-downloads` by default on Windows. Change it any
+time in the app under Library → Change — the choice is saved to `config.json`
+(next to `server.js`, never committed to git) and survives restarts. You can
+also edit `config.json` by hand, or override with the `DOWNLOAD_DIR` env var.
+
+Power users: `config.json` accepts `{ "downloadDir": "E:\\video-downloads", "port": 3000 }` — see `config.example.json`. The `bin\` folder and `config.json` are gitignored.
 
 ## Deploy to Railway (3 steps)
 
