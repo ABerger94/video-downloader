@@ -124,6 +124,20 @@
   .pl-row.unavail { opacity: 0.45; }
   .pl-tools { display: flex; gap: 10px; margin: 10px 0; }
   .pl-tools button { flex: 1; padding: 9px 10px; font-size: 14px; }
+  .se-row { display: flex; align-items: center; gap: 8px; margin-top: 12px; }
+  .se-row label { color: var(--muted); font-size: 13px; }
+  .se-row input[type="number"] {
+    width: 64px;
+    background: #0c0f14;
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 8px;
+    padding: 8px 6px;
+    font-size: 15px;
+    outline: none;
+  }
+  .se-row input:focus { border-color: var(--accent); }
+  .se-hint { color: var(--muted); font-size: 12px; }
 </style>
 </head>
 <body>
@@ -156,6 +170,13 @@
       <select id="quality"></select>
       <button id="dlBtn">Download</button>
     </div>
+    <div class="se-row">
+      <label for="seSeason">Season</label>
+      <input type="number" id="seSeason" min="1" max="999" inputmode="numeric" placeholder="—">
+      <label for="seEpisode">Episode</label>
+      <input type="number" id="seEpisode" min="1" max="999" inputmode="numeric" placeholder="—">
+      <span class="se-hint" id="seHint"></span>
+    </div>
     <p class="error hidden" id="dlErr"></p>
   </div>
 
@@ -187,6 +208,7 @@
   </div>
 </div>
 
+<script src="episode-meta.js"></script>
 <script>
 const $ = (id) => document.getElementById(id);
 let currentInfo = null;
@@ -255,6 +277,14 @@ function fillInfoCard(info) {
   $('thumb').style.display = info.thumbnail ? '' : 'none';
   $('vTitle').textContent = info.title || 'Untitled';
   $('vMeta').textContent = [info.uploader, info.duration].filter(Boolean).join(' · ');
+  // Season/episode: prefill from whatever the server detected (yt-dlp's own
+  // metadata first, URL/title parsing as fallback). Editable — it lands in
+  // the saved filename as e.g. "Show Name S02E05.mp4".
+  $('seSeason').value = info.season || '';
+  $('seEpisode').value = info.episode || '';
+  $('seHint').textContent = (info.season || info.episode)
+    ? 'Detected from the link' + (info.episode_tag ? ' (' + info.episode_tag + ')' : '')
+    : '';
   const q = $('quality');
   q.innerHTML = '';
   (info.formats || []).forEach((f) => {
@@ -310,7 +340,10 @@ function fillPlaylistCard(info) {
     tt.textContent = item.title;
     const tm = document.createElement('div');
     tm.className = 'tm';
-    tm.textContent = [item.uploader, item.duration, item.page_url ? '' : 'link unavailable']
+    const tag = window.episodeMeta
+      ? window.episodeMeta.formatEpisodeTag(item.season, item.episode)
+      : null;
+    tm.textContent = [tag, item.uploader, item.duration, item.page_url ? '' : 'link unavailable']
       .filter(Boolean).join(' · ');
     t.appendChild(tt);
     t.appendChild(tm);
@@ -358,7 +391,10 @@ $('plDlBtn').addEventListener('click', async () => {
     try {
       const { job_id } = await api('/api/download', {
         method: 'POST',
-        body: JSON.stringify({ url: item.page_url, format_id: formatId, title: item.title }),
+        body: JSON.stringify({
+          url: item.page_url, format_id: formatId, title: item.title,
+          season: item.season || null, episode: item.episode || null,
+        }),
       });
       trackJob(job_id, item.title);
       queued++;
@@ -391,6 +427,9 @@ $('deepBtn').addEventListener('click', async () => {
       deep: true,
       title: info.title,
       thumbnail: info.thumbnail,
+      season: info.season,
+      episode: info.episode,
+      episode_tag: info.episode_tag,
       candidates: info.candidates,
     };
     // Reuse the same info card; each candidate becomes a quality option.
@@ -413,10 +452,20 @@ $('deepBtn').addEventListener('click', async () => {
 });
 
 // ---- Start download ----
+function seInputs() {
+  const s = parseInt($('seSeason').value, 10);
+  const e = parseInt($('seEpisode').value, 10);
+  return {
+    season: Number.isFinite(s) && s > 0 ? s : null,
+    episode: Number.isFinite(e) && e > 0 ? e : null,
+  };
+}
+
 $('dlBtn').addEventListener('click', async () => {
   if (!currentInfo) return;
   hideErr($('dlErr'));
   $('dlBtn').disabled = true;
+  const { season, episode } = seInputs();
   try {
     let job_id;
     if (currentInfo.deep) {
@@ -425,7 +474,7 @@ $('dlBtn').addEventListener('click', async () => {
       if (!cand) throw new Error('Pick a stream first.');
       ({ job_id } = await api('/api/deep-download', {
         method: 'POST',
-        body: JSON.stringify({ streamUrl: cand.url, type: cand.type, title: currentInfo.title, tokenize: cand.tokenize || null }),
+        body: JSON.stringify({ streamUrl: cand.url, type: cand.type, title: currentInfo.title, tokenize: cand.tokenize || null, season, episode }),
       }));
     } else {
       ({ job_id } = await api('/api/download', {
@@ -434,6 +483,7 @@ $('dlBtn').addEventListener('click', async () => {
           url: currentInfo.webpage_url,
           format_id: $('quality').value,
           title: currentInfo.title,
+          season, episode,
         }),
       }));
     }
@@ -491,6 +541,13 @@ async function pollAllJobs() {
   for (const [jobId, entry] of [...activeJobs]) {
     try {
       const j = await api('/api/jobs/' + jobId);
+      if (!entry.tagged && (j.season || j.episode) && window.episodeMeta) {
+        const tag = window.episodeMeta.formatEpisodeTag(j.season, j.episode);
+        if (tag) {
+          entry.card.querySelector('.info-title').textContent = tag + ' · ' + entry.title;
+          entry.tagged = true;
+        }
+      }
       entry.fill.style.width = Math.min(100, j.percent || 0) + '%';
       if (j.status === 'queued') {
         entry.meta.textContent = 'Waiting for a download slot…';
