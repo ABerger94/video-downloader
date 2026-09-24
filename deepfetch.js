@@ -97,7 +97,11 @@ async function deepFetchOnce(pageUrl) {
     ],
   });
 
-  const found = new Map(); // url -> { url, type, label, tokenize? }
+  const found = new Map(); // url -> { url, type, label, tokenize?, referer? }
+  // While walking player embeds, remember which embed page is active so
+  // candidates can carry it as their Referer (many stream hosts 403/404
+  // without it).
+  let activeEmbed = null;
   const addCandidate = (url, type, tokenize) => {
     if (!url || !/^https?:\/\//i.test(url)) return;
     // VidEasy-style proxy wrapper: p1.netocdn.site/proxy?url=<inner>&...
@@ -116,6 +120,7 @@ async function deepFetchOnce(pageUrl) {
     const label = type === 'hls' ? 'HLS stream' : 'MP4 direct';
     const cand = { url, type, label };
     if (tokenize) cand.tokenize = tokenize;
+    if (activeEmbed) cand.referer = activeEmbed;
     found.set(url, cand);
   };
 
@@ -188,6 +193,7 @@ async function deepFetchOnce(pageUrl) {
       for (const embedUrl of embeds) {
         if (found.size > 0) break;
         embedsTried++;
+        activeEmbed = embedUrl;
         await page.goto(embedUrl, { waitUntil: 'commit', timeout: 45000 }).catch(() => {});
         await page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
         await page.waitForTimeout(3000);
@@ -200,6 +206,7 @@ async function deepFetchOnce(pageUrl) {
           }
         }
       }
+      activeEmbed = null;
     };
 
     if (found.size === 0) {
