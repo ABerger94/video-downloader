@@ -87,16 +87,21 @@ async function deepFetchOnce(pageUrl) {
 
   let context;
   try {
-    context = await browser.newContext({
+    // Playwright rejects `proxy: null` ("expected object, got null"), so
+    // only pass the option when a proxy is actually configured. On Alek's
+    // laptop there is no proxy env var -> direct connection.
+    const contextOpts = {
       userAgent: UA,
       viewport: { width: 1280, height: 720 },
       locale: 'en-US',
       javaScriptEnabled: true,
-      proxy: proxyFromEnv(), // null when no proxy env set (e.g. Railway -> direct)
       // DEEP_FETCH_INSECURE_TLS=1 accepts the egress proxy's MITM cert in
       // sandboxes that TLS-intercept browser traffic. Never set in production.
       ignoreHTTPSErrors: process.env.DEEP_FETCH_INSECURE_TLS === '1',
-    });
+    };
+    const proxy = proxyFromEnv();
+    if (proxy) contextOpts.proxy = proxy;
+    context = await browser.newContext(contextOpts);
     // Close popup tabs these sites love to spawn on click — but never the
     // main page itself ('page' fires for it too).
     const page = await context.newPage();
