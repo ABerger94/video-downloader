@@ -14,12 +14,31 @@ const { deepFetch } = require('./deepfetch');
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 
-const PORT = process.env.PORT || 3000;
-// Configurable via DOWNLOAD_DIR (e.g. DOWNLOAD_DIR=E:\videos on Windows).
-// Defaults to ./downloads next to server.js. Everything — yt-dlp output,
-// deep-fetch downloads, the /api/files listing, file serving, DELETE, and
-// the 24h sweep — resolves through this one directory.
-const DOWNLOADS_DIR = path.resolve(process.env.DOWNLOAD_DIR || path.join(__dirname, 'downloads'));
+// ---------------------------------------------------------------------------
+// Config: config.json (next to server.js, gitignored) < env vars.
+// config.json is where this machine's choices live: save folder, port.
+// ---------------------------------------------------------------------------
+const CONFIG_PATH = path.join(__dirname, 'config.json');
+function loadConfig() {
+  try {
+    return JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+  } catch {
+    return {};
+  }
+}
+function saveConfig(cfg) {
+  fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2) + '\n');
+}
+const fileConfig = loadConfig();
+
+const PORT = process.env.PORT || fileConfig.port || 3000;
+// Where finished videos land. Change it any time from the web UI (Library >
+// Change) or with the DOWNLOAD_DIR env var. On Windows it defaults to
+// E:\video-downloads — exactly where Alek wants them.
+const defaultDir = process.platform === 'win32'
+  ? 'E:\\video-downloads'
+  : path.join(__dirname, 'downloads');
+let DOWNLOADS_DIR = path.resolve(process.env.DOWNLOAD_DIR || fileConfig.downloadDir || defaultDir);
 fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
 
 const MAX_CONCURRENT = 2; // downloads running at once; extras queue
@@ -29,9 +48,17 @@ const FILE_TTL_MS = 24 * 60 * 60 * 1000; // delete files older than 24h
 const INFO_TIMEOUT_MS = 90000;
 
 // ---------------------------------------------------------------------------
-// yt-dlp resolution: prefer `python3 -m yt_dlp`, fall back to `yt-dlp` on PATH.
+// Binary resolution: explicit env override > bundled Windows exe (bin\) >
+// whatever is on PATH. The Windows setup script drops yt-dlp.exe /
+// ffmpeg.exe / ffprobe.exe into bin\ so no Python install is needed.
 // ---------------------------------------------------------------------------
 function pickYtDlp() {
+  const exe = process.env.YTDLP_PATH ||
+    (process.platform === 'win32' ? path.join(__dirname, 'bin', 'yt-dlp.exe') : null);
+  if (exe && fs.existsSync(exe)) {
+    const r = spawnSync(exe, ['--version'], { timeout: 20000, encoding: 'utf8' });
+    if (r.status === 0) return { cmd: exe, prefix: [] };
+  }
   const r1 = spawnSync('python3', ['-m', 'yt_dlp', '--version'], { timeout: 20000, encoding: 'utf8' });
   if (r1.status === 0) return { cmd: 'python3', prefix: ['-m', 'yt_dlp'] };
   const r2 = spawnSync('yt-dlp', ['--version'], { timeout: 20000, encoding: 'utf8' });
@@ -40,10 +67,21 @@ function pickYtDlp() {
 }
 const YTDLP = pickYtDlp();
 if (!YTDLP) {
-  console.error('FATAL: yt-dlp not found. Install it with: pip install yt-dlp');
+  console.error('FATAL: yt-dlp not found. On Windows run setup-windows.bat; elsewhere: pip install yt-dlp');
   process.exit(1);
 }
 console.log('yt-dlp:', [YTDLP.cmd, ...YTDLP.prefix].join(' '));
+
+function pickBin(name) {
+  // name: 'ffmpeg' | 'ffprobe'
+  const override = process.env[name.toUpperCase() + '_PATH'] ||
+    (process.platform === 'win32' ? path.join(__dirname, 'bin', name + '.exe') : null);
+  if (override && fs.existsSync(override)) return override;
+  return name; // on PATH
+}
+const FFMPEG = pickBin('ffmpeg');
+const FFPROBE = pickBin('ffprobe');
+console.log('ffmpeg:', FFMPEG, '| ffprobe:', FFPROBE);
 
 function spawnYtDlp(args, opts = {}) {
   return spawn(YTDLP.cmd, [...YTDLP.prefix, ...args], opts);
@@ -270,15 +308,10 @@ function streamHeadersArgs(streamUrl) {
     return [];
   }
 }
-function ffmpegProxyArgs() {
-  const p = process.env.https_proxy || process.env.HTTPS_PROXY ||
-            process.env.http_proxy || process.env.HTTP_PROXY;
-  return p ? ['-http_proxy', p] : [];
-}
 
 function ffprobeDuration(url) {
   return new Promise((resolve) => {
-    const child = spawn('ffprobe', [
+    const child = spawn(FFPROBE, [
       '-v', 'error', ...ffmpegProxyArgs(), ...streamHeadersArgs(url),
       '-show_entries', 'format=duration',
       '-of', 'default=noprint_wrappers=1:nokey=1', url,
@@ -306,7 +339,7 @@ async function startHlsDownload(job, outPath) {
     '-c', 'copy', '-bsf:a', 'aac_adtstoasc',
     outPath,
   ];
-  const child = spawn('ffmpeg', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+  const child = spawn(FFMPEG, args, { stdio: ['ignore', 'pipe', 'pipe'] });
   let buf = '', lastError = null, tooBig = false;
 
   // HLS has no reliable upfront size: watch the growing file and kill ffmpeg
@@ -620,6 +653,37 @@ app.delete('/api/file/:name', (req, res) => {
   } catch {
     res.status(500).json({ error: 'Could not delete file.' });
   }
+});
+
+// GET /api/settings -> { downloadDir, port, platform }
+app.get('/api/settings', (req, res) => {
+  res.json({ downloadDir: DOWNLOADS_DIR, port: PORT, platform: process.platform });
+});
+
+// POST /api/settings {downloadDir} -> move the save folder; persists to config.json
+app.post('/api/settings', (req, res) => {
+  const { downloadDir } = req.body || {};
+  if (typeof downloadDir !== 'string' || !downloadDir.trim()) {
+    return res.status(400).json({ error: 'Give me a folder path.' });
+  }
+  const raw = downloadDir.trim();
+  // Check the raw input: path.resolve() always returns an absolute path,
+  // so validating the resolved value would accept "relative/path" too.
+  if (!path.isAbsolute(raw)) {
+    return res.status(400).json({ error: 'Use a full path, e.g. E:\\video-downloads' });
+  }
+  const resolved = path.resolve(raw);
+  try {
+    fs.mkdirSync(resolved, { recursive: true });
+    fs.accessSync(resolved, fs.constants.W_OK);
+  } catch {
+    return res.status(400).json({ error: 'Cannot write to that folder.' });
+  }
+  DOWNLOADS_DIR = resolved;
+  try {
+    saveConfig({ ...loadConfig(), downloadDir: resolved });
+  } catch { /* non-fatal: keeps working for this run */ }
+  res.json({ downloadDir: DOWNLOADS_DIR });
 });
 
 // ---------------------------------------------------------------------------
