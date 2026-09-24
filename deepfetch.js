@@ -120,7 +120,10 @@ async function deepFetchOnce(pageUrl) {
     const label = type === 'hls' ? 'HLS stream' : 'MP4 direct';
     const cand = { url, type, label };
     if (tokenize) cand.tokenize = tokenize;
-    if (activeEmbed) cand.referer = activeEmbed;
+    if (activeEmbed) {
+      cand.referer = activeEmbed;
+      try { cand.label = `${label} · ${new URL(activeEmbed).hostname}`; } catch { /* keep label */ }
+    }
     found.set(url, cand);
   };
 
@@ -189,9 +192,10 @@ async function deepFetchOnce(pageUrl) {
     // in-page POSTs came back empty), fall back to plain-HTTPS resolution
     // and still walk the embeds in the browser.
     let embedsTried = 0;
+    // Walk every embed and keep every candidate: the first provider's link
+    // is sometimes a dud, so the picker needs the fallbacks.
     const walkEmbeds = async (embeds) => {
       for (const embedUrl of embeds) {
-        if (found.size > 0) break;
         embedsTried++;
         activeEmbed = embedUrl;
         await page.goto(embedUrl, { waitUntil: 'commit', timeout: 45000 }).catch(() => {});
