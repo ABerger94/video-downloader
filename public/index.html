@@ -63,6 +63,12 @@
   button.ghost { background: transparent; border: 1px solid var(--border); color: var(--text); }
   button.danger { background: transparent; border: 1px solid var(--danger); color: var(--danger); }
   .hidden { display: none !important; }
+  .save-line { font-size: 13px; color: var(--muted); margin: 0 0 10px; word-break: break-all; }
+  .save-line code { color: var(--text); font-size: 12.5px; }
+  .link-btn {
+    background: none; border: none; padding: 0 0 0 6px;
+    color: var(--accent); font-size: 13px; font-weight: 600; cursor: pointer;
+  }
   .info-card { display: flex; gap: 12px; }
   .info-card img {
     width: 120px; height: 68px; object-fit: cover; border-radius: 8px;
@@ -147,6 +153,7 @@
   <!-- Library -->
   <h2>Library</h2>
   <div class="card" id="libCard">
+    <p class="save-line">Saving to <code id="saveDir">…</code><button class="link-btn" id="changeDirBtn">Change</button></p>
     <div id="libList"><p class="empty">Nothing downloaded yet.</p></div>
   </div>
 </div>
@@ -383,6 +390,29 @@ async function refreshLibrary() {
 }
 
 refreshLibrary();
+
+// ---- Save folder setting ----
+async function refreshSettings() {
+  try {
+    const s = await api('/api/settings');
+    $('saveDir').textContent = s.downloadDir;
+  } catch {
+    $('saveDir').textContent = '(unknown)';
+  }
+}
+$('changeDirBtn').addEventListener('click', async () => {
+  const cur = $('saveDir').textContent;
+  const next = prompt('Save downloads to which folder? (full path, e.g. E:\\video-downloads)', cur);
+  if (!next || next.trim() === cur) return;
+  try {
+    const s = await api('/api/settings', { method: 'POST', body: JSON.stringify({ downloadDir: next.trim() }) });
+    $('saveDir').textContent = s.downloadDir;
+    refreshLibrary();
+  } catch (e) {
+    alert(e.message);
+  }
+});
+refreshSettings();
 </script>
 </body>
 </html>
