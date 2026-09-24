@@ -384,7 +384,7 @@ $('deepBtn').addEventListener('click', async () => {
   const url = $('url').value.trim();
   hideErr($('fetchErr'));
   $('deepBtn').disabled = true;
-  $('deepStatus').textContent = 'Opening the page in a headless browser…';
+  $('deepStatus').textContent = 'Resolving streams…';
   try {
     const info = await api('/api/deep-info', { method: 'POST', body: JSON.stringify({ url }) });
     currentInfo = {
@@ -425,7 +425,7 @@ $('dlBtn').addEventListener('click', async () => {
       if (!cand) throw new Error('Pick a stream first.');
       ({ job_id } = await api('/api/deep-download', {
         method: 'POST',
-        body: JSON.stringify({ streamUrl: cand.url, type: cand.type, title: currentInfo.title }),
+        body: JSON.stringify({ streamUrl: cand.url, type: cand.type, title: currentInfo.title, tokenize: cand.tokenize || null }),
       }));
     } else {
       ({ job_id } = await api('/api/download', {

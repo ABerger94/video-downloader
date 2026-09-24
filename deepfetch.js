@@ -7,6 +7,7 @@
 //   candidates: [{ url, type: 'hls' | 'mp4', label }]
 
 const { chromium } = require('playwright-chromium');
+const { isVidsrcEmbed, resolveVidsrcStreams } = require('./vidsrc');
 
 const UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
@@ -48,7 +49,38 @@ function queuedDeepFetch(pageUrl) {
   return run;
 }
 
+// Fast path: vidsrc embeds (5movies.cc's VidPlay server) resolve fully over
+// plain HTTPS via vidsrc.js — no headless browser needed. Runs before the
+// browser path and inside it (for embeds the in-page resolver finds).
+// Returns a deepFetch-style result or null.
+async function tryVidsrcFastPath(pageUrl, embeds) {
+  try {
+    const list = embeds || (isVidsrcEmbed(pageUrl)
+      ? [pageUrl]
+      : await resolve5moviesEmbedsViaHttp(pageUrl));
+    for (const e of list) {
+      if (!isVidsrcEmbed(e)) continue;
+      const r = await resolveVidsrcStreams(e);
+      if (r.urls.length) {
+        return {
+          title: r.title || 'Deep fetch result',
+          thumbnail: null,
+          candidates: rankCandidates(r.urls.map((u) => ({
+            url: u, type: 'hls', label: 'HLS stream', tokenize: 'vidsrc',
+          }))),
+          note: null,
+        };
+      }
+    }
+  } catch { /* fall through to the browser path */ }
+  return null;
+}
+
 async function deepFetchOnce(pageUrl) {
+  // vidsrc fast path first: seconds instead of a full browser session.
+  const fast = await tryVidsrcFastPath(pageUrl);
+  if (fast) return fast;
+
   // CHROME_EXECUTABLE_PATH lets deployments use a system Chrome / Chrome for
   // Testing instead of Playwright's downloaded Chromium (e.g. when the
   // Playwright CDN is unreachable). On Railway the build phase installs
@@ -65,8 +97,8 @@ async function deepFetchOnce(pageUrl) {
     ],
   });
 
-  const found = new Map(); // url -> { url, type, label }
-  const addCandidate = (url, type) => {
+  const found = new Map(); // url -> { url, type, label, tokenize? }
+  const addCandidate = (url, type, tokenize) => {
     if (!url || !/^https?:\/\//i.test(url)) return;
     // VidEasy-style proxy wrapper: p1.netocdn.site/proxy?url=<inner>&...
     // The wrapper 403s non-browser clients; the inner URL is the real
@@ -82,7 +114,9 @@ async function deepFetchOnce(pageUrl) {
     // Skip tiny junk: analytics pixels, thumbnails, ad beacons.
     if (/\.(png|jpe?g|gif|webp|svg|ico|css|js|woff2?)(\?|#|$)/i.test(url)) return;
     const label = type === 'hls' ? 'HLS stream' : 'MP4 direct';
-    found.set(url, { url, type, label });
+    const cand = { url, type, label };
+    if (tokenize) cand.tokenize = tokenize;
+    found.set(url, cand);
   };
 
   let context;
@@ -171,7 +205,15 @@ async function deepFetchOnce(pageUrl) {
     if (found.size === 0) {
       let embeds = await resolve5moviesEmbeds(page, pageUrl);
       if (!embeds.length) embeds = await resolve5moviesEmbedsViaHttp(pageUrl);
-      await walkEmbeds(embeds);
+      // vidsrc embeds: the direct HTTPS chain beats the browser walk.
+      for (const e of embeds) {
+        if (found.size || !isVidsrcEmbed(e)) continue;
+        try {
+          const r = await resolveVidsrcStreams(e);
+          for (const u of r.urls) addCandidate(u, 'hls', 'vidsrc');
+        } catch { /* keep walking */ }
+      }
+      if (found.size === 0) await walkEmbeds(embeds);
     }
 
     if (found.size === 0) {

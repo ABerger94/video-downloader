@@ -10,6 +10,7 @@ const crypto = require('crypto');
 const http = require('http');
 const https = require('https');
 const { deepFetch } = require('./deepfetch');
+const { stampVidsrcToken } = require('./vidsrc');
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
@@ -143,11 +144,12 @@ function pumpQueue() {
   }
 }
 
-function newJob({ url, formatId, title, kind = 'ytdlp', streamUrl, streamType }) {
+function newJob({ url, formatId, title, kind = 'ytdlp', streamUrl, streamType, tokenize }) {
   const id = crypto.randomBytes(8).toString('hex');
   const job = {
     id, url: url || null, formatId: formatId || null, title: title || null,
     kind, streamUrl: streamUrl || null, streamType: streamType || null,
+    tokenize: tokenize || null,
     status: 'queued', percent: 0, speed: null, eta: null,
     filename: null, error: null, createdAt: Date.now(),
   };
@@ -268,11 +270,18 @@ function uniqueOutPath(base) {
 }
 
 function startDeepDownload(job) {
+  // Hold the concurrency slot immediately; the vidsrc token (short-lived,
+  // IP-bound) is stamped on just before ffmpeg/ffprobe run.
   job.status = 'downloading';
   const outPath = uniqueOutPath(sanitizeTitle(job.title));
   job.filename = path.basename(outPath);
-  if (job.streamType === 'hls') startHlsDownload(job, outPath);
-  else startHttpDownload(job, outPath);
+  const ready = (job.tokenize === 'vidsrc')
+    ? stampVidsrcToken(job.streamUrl).then((u) => { job.streamUrl = u; }).catch(() => {})
+    : Promise.resolve();
+  ready.then(() => {
+    if (job.streamType === 'hls') startHlsDownload(job, outPath);
+    else startHttpDownload(job, outPath);
+  });
 }
 
 // ffmpeg/ffprobe don't read proxy env vars natively; pass -http_proxy when
@@ -645,9 +654,9 @@ app.post('/api/deep-info', async (req, res) => {
   }
 });
 
-// POST /api/deep-download {streamUrl, type: 'hls'|'mp4', title?} -> {job_id}
+// POST /api/deep-download {streamUrl, type: 'hls'|'mp4', title?, tokenize?} -> {job_id}
 app.post('/api/deep-download', (req, res) => {
-  const { streamUrl, type, title } = req.body || {};
+  const { streamUrl, type, title, tokenize } = req.body || {};
   if (!validUrl(streamUrl)) return res.status(400).json({ error: 'Bad stream URL.' });
   if (type !== 'hls' && type !== 'mp4') return res.status(400).json({ error: 'Unknown stream type.' });
   const job = newJob({
@@ -655,6 +664,8 @@ app.post('/api/deep-download', (req, res) => {
     streamUrl,
     streamType: type,
     title: typeof title === 'string' ? title.slice(0, 200) : null,
+    // tokenize: 'vidsrc' — stamp a fresh short-lived token at download time.
+    tokenize: tokenize === 'vidsrc' ? 'vidsrc' : null,
   });
   res.json({ job_id: job.id, status: job.status });
 });
