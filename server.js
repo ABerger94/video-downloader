@@ -481,43 +481,98 @@ function fmtEta(sec) {
 // API
 // ---------------------------------------------------------------------------
 
-// POST /api/info {url} -> video metadata + curated format list
+// POST /api/info {url} -> single-video metadata + curated format list,
+// or a playlist listing {playlist:true, items:[...]} when the URL holds many videos.
 app.post('/api/info', (req, res) => {
   const { url } = req.body || {};
   if (!validUrl(url)) return res.status(400).json({ error: 'Give me a valid http(s) URL.' });
 
-  const child = spawnYtDlp(
-    ['--dump-single-json', '--no-playlist', '--no-warnings', url],
-    { stdio: ['ignore', 'pipe', 'pipe'], timeout: INFO_TIMEOUT_MS, maxBuffer: 64 * 1024 * 1024 }
-  );
-
-  let out = '', err = '';
-  child.stdout.on('data', (c) => { out += c; });
-  child.stderr.on('data', (c) => { err += c; });
-  child.on('error', (e) => res.status(500).json({ error: 'Could not run yt-dlp: ' + e.message }));
-  child.on('close', (code) => {
-    if (res.headersSent) return;
-    if (code !== 0) {
-      const msg = (err.match(/^ERROR:\s*(.+)$/m) || [])[1] || 'yt-dlp could not read that URL.';
-      return res.status(422).json({ error: msg.trim() });
+  // Step 1: cheap flat lookup — tells a playlist apart from a single video.
+  runYtDlpJson(['--dump-single-json', '--flat-playlist', '--no-warnings', url], (flatErr, flat) => {
+    if (flatErr) return res.status(422).json({ error: flatErr });
+    const entries = Array.isArray(flat.entries) ? flat.entries.filter(Boolean) : [];
+    if ((flat._type === 'playlist' || entries.length > 1) && entries.length > 1) {
+      return res.json(playlistPayload(flat, entries, url));
     }
-    let data;
-    try {
-      data = JSON.parse(out);
-    } catch {
-      return res.status(500).json({ error: 'Could not parse video info.' });
-    }
-    res.json({
-      id: data.id || null,
-      title: data.title || 'Untitled',
-      thumbnail: data.thumbnail || null,
-      duration: data.duration ? fmtDuration(data.duration) : null,
-      uploader: data.uploader || data.channel || null,
-      webpage_url: data.webpage_url || url,
-      formats: curateFormats(data.formats || []),
+    // Single video: full info (formats, thumbnail) for the quality picker.
+    runYtDlpJson(['--dump-single-json', '--no-playlist', '--no-warnings', url], (err, data) => {
+      if (err) return res.status(422).json({ error: err });
+      res.json({
+        id: data.id || null,
+        title: data.title || 'Untitled',
+        thumbnail: data.thumbnail || null,
+        duration: data.duration ? fmtDuration(data.duration) : null,
+        uploader: data.uploader || data.channel || null,
+        webpage_url: data.webpage_url || url,
+        formats: curateFormats(data.formats || []),
+      });
     });
   });
 });
+
+// Run yt-dlp and parse its --dump-single-json output. cb(errMsg, data).
+function runYtDlpJson(args, cb) {
+  let done = false;
+  const finish = (err, data) => { if (!done) { done = true; cb(err, data); } };
+  const child = spawnYtDlp(
+    args,
+    { stdio: ['ignore', 'pipe', 'pipe'], timeout: INFO_TIMEOUT_MS, maxBuffer: 64 * 1024 * 1024 }
+  );
+  let out = '', err = '';
+  child.stdout.on('data', (c) => { out += c; });
+  child.stderr.on('data', (c) => { err += c; });
+  child.on('error', (e) => finish('Could not run yt-dlp: ' + e.message));
+  child.on('close', (code) => {
+    if (code !== 0) {
+      const msg = (err.match(/^ERROR:\s*(.+)$/m) || [])[1] || 'yt-dlp could not read that URL.';
+      return finish(msg.trim());
+    }
+    try {
+      finish(null, JSON.parse(out));
+    } catch {
+      finish('Could not parse video info.');
+    }
+  });
+}
+
+// Shape a flat-playlist dump into a pickable item list (cap 200, note the total).
+function playlistPayload(data, entries, url) {
+  const extractor = data.extractor_key || data.extractor || '';
+  const items = [];
+  entries.slice(0, 200).forEach((e, i) => {
+    items.push({
+      index: i,
+      id: e.id || null,
+      title: e.title || ('Video ' + (i + 1)),
+      duration: e.duration ? fmtDuration(e.duration) : null,
+      uploader: e.uploader || e.channel || null,
+      page_url: entryPageUrl(e, extractor),
+    });
+  });
+  return {
+    playlist: true,
+    title: data.title || 'Playlist',
+    uploader: data.uploader || data.channel || null,
+    count: items.length,
+    total_count: entries.length,
+    webpage_url: data.webpage_url || url,
+    items,
+  };
+}
+
+// Resolve a per-video page URL from a flat playlist entry.
+function entryPageUrl(e, extractorKey) {
+  for (const cand of [e.webpage_url, e.url]) {
+    if (cand && validUrl(cand)) return String(cand);
+  }
+  const id = e.id ? String(e.id) : null;
+  if (id) {
+    const key = String(extractorKey || '').toLowerCase();
+    if (key.includes('youtube')) return 'https://www.youtube.com/watch?v=' + id;
+    if (key.includes('vimeo')) return 'https://vimeo.com/' + id;
+  }
+  return null;
+}
 
 // Keep the list small and useful: combined mp4s at a few heights, best audio, and "best" fallback.
 function curateFormats(formats) {
@@ -562,7 +617,9 @@ function curateFormats(formats) {
 app.post('/api/download', (req, res) => {
   const { url, format_id, title } = req.body || {};
   if (!validUrl(url)) return res.status(400).json({ error: 'Give me a valid http(s) URL.' });
-  if (!format_id || typeof format_id !== 'string' || !/^[A-Za-z0-9_+\-\[\]().,= ]+$/.test(format_id)) {
+  // format_id is passed as a single argv element (no shell), so yt-dlp
+  // format-selector syntax (*, <, >, /, !, ?, ~, ^, $, |) is safe here.
+  if (!format_id || typeof format_id !== 'string' || !/^[A-Za-z0-9_+\-\[\]().,= *<>\/!?~^$|]+$/.test(format_id)) {
     return res.status(400).json({ error: 'Pick a quality first.' });
   }
   const job = newJob({
