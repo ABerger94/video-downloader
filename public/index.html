@@ -115,6 +115,10 @@
       <button id="fetchBtn">Fetch</button>
     </div>
     <p class="error hidden" id="fetchErr"></p>
+    <div class="hidden" id="deepRow" style="margin-top:10px;">
+      <button class="ghost" id="deepBtn" style="width:100%;">Try deep fetch</button>
+      <p class="status" id="deepStatus"></p>
+    </div>
   </div>
 
   <!-- Video info + quality picker -->
@@ -178,25 +182,69 @@ $('fetchBtn').addEventListener('click', async () => {
   try {
     const info = await api('/api/info', { method: 'POST', body: JSON.stringify({ url }) });
     currentInfo = info;
-    $('thumb').src = info.thumbnail || '';
-    $('vTitle').textContent = info.title || 'Untitled';
-    $('vMeta').textContent = [info.uploader, info.duration].filter(Boolean).join(' · ');
-    const q = $('quality');
-    q.innerHTML = '';
-    (info.formats || []).forEach((f) => {
-      const o = document.createElement('option');
-      o.value = f.id;
-      o.textContent = f.label + (f.size ? ' — ' + f.size : '');
-      q.appendChild(o);
-    });
-    $('infoCard').classList.remove('hidden');
+    fillInfoCard(info);
     hideErr($('dlErr'));
+    $('deepRow').classList.add('hidden');
   } catch (e) {
     showErr($('fetchErr'), e.message);
     $('infoCard').classList.add('hidden');
+    // yt-dlp can't read this site — offer the headless-browser deep fetch.
+    if (/unsupported url/i.test(e.message)) {
+      $('deepRow').classList.remove('hidden');
+      $('deepStatus').textContent = 'This site needs the deep fetch: a real browser opens the page and finds the video stream. Takes ~30–60s.';
+    } else {
+      $('deepRow').classList.add('hidden');
+    }
   } finally {
     $('fetchBtn').disabled = false;
     $('fetchBtn').textContent = 'Fetch';
+  }
+});
+
+function fillInfoCard(info) {
+  $('thumb').src = info.thumbnail || '';
+  $('thumb').style.display = info.thumbnail ? '' : 'none';
+  $('vTitle').textContent = info.title || 'Untitled';
+  $('vMeta').textContent = [info.uploader, info.duration].filter(Boolean).join(' · ');
+  const q = $('quality');
+  q.innerHTML = '';
+  (info.formats || []).forEach((f) => {
+    const o = document.createElement('option');
+    o.value = f.id;
+    o.textContent = f.label + (f.size ? ' — ' + f.size : '');
+    q.appendChild(o);
+  });
+  $('infoCard').classList.remove('hidden');
+}
+
+// ---- Deep fetch (headless browser stream sniffing) ----
+$('deepBtn').addEventListener('click', async () => {
+  const url = $('url').value.trim();
+  hideErr($('fetchErr'));
+  $('deepBtn').disabled = true;
+  $('deepStatus').textContent = 'Opening the page in a headless browser…';
+  try {
+    const info = await api('/api/deep-info', { method: 'POST', body: JSON.stringify({ url }) });
+    currentInfo = {
+      deep: true,
+      title: info.title,
+      thumbnail: info.thumbnail,
+      candidates: info.candidates,
+    };
+    // Reuse the same info card; each candidate becomes a quality option.
+    info.formats = (info.candidates || []).map((c, i) => ({
+      id: 'deep:' + i,
+      label: c.label + ' (' + c.type.toUpperCase() + ')',
+      size: null,
+    }));
+    fillInfoCard(info);
+    hideErr($('dlErr'));
+    $('deepRow').classList.add('hidden');
+  } catch (e) {
+    showErr($('fetchErr'), e.message);
+    $('deepStatus').textContent = '';
+  } finally {
+    $('deepBtn').disabled = false;
   }
 });
 
@@ -206,14 +254,25 @@ $('dlBtn').addEventListener('click', async () => {
   hideErr($('dlErr'));
   $('dlBtn').disabled = true;
   try {
-    const { job_id } = await api('/api/download', {
-      method: 'POST',
-      body: JSON.stringify({
-        url: currentInfo.webpage_url,
-        format_id: $('quality').value,
-        title: currentInfo.title,
-      }),
-    });
+    let job_id;
+    if (currentInfo.deep) {
+      const idx = parseInt(($('quality').value || '').replace('deep:', ''), 10);
+      const cand = (currentInfo.candidates || [])[idx];
+      if (!cand) throw new Error('Pick a stream first.');
+      ({ job_id } = await api('/api/deep-download', {
+        method: 'POST',
+        body: JSON.stringify({ streamUrl: cand.url, type: cand.type, title: currentInfo.title }),
+      }));
+    } else {
+      ({ job_id } = await api('/api/download', {
+        method: 'POST',
+        body: JSON.stringify({
+          url: currentInfo.webpage_url,
+          format_id: $('quality').value,
+          title: currentInfo.title,
+        }),
+      }));
+    }
     startPolling(job_id, currentInfo.title);
   } catch (e) {
     showErr($('dlErr'), e.message);
