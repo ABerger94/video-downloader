@@ -580,7 +580,7 @@ app.post('/api/deep-info', async (req, res) => {
   try {
     const result = await deepFetch(url);
     if (!result.candidates.length) {
-      return res.status(422).json({ error: 'Deep fetch found no playable streams on that page.' });
+      return res.status(422).json({ error: 'Deep fetch found no playable streams on that page.' + (result.note ? ' ' + result.note : '') });
     }
     res.json(result);
   } catch (e) {
