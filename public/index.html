@@ -143,12 +143,9 @@
     <p class="error hidden" id="dlErr"></p>
   </div>
 
-  <!-- Active download progress -->
-  <div class="card hidden" id="progCard">
-    <p class="info-title" id="progTitle">Downloading…</p>
-    <div class="progress-track"><div class="progress-fill" id="progFill"></div></div>
-    <p class="progress-meta" id="progMeta">Starting…</p>
-  </div>
+  <!-- Active downloads (multiple at once) -->
+  <h2 id="jobsHeader" class="hidden">Downloads</h2>
+  <div id="jobs"></div>
 
   <!-- Library -->
   <h2>Library</h2>
@@ -161,7 +158,8 @@
 <script>
 const $ = (id) => document.getElementById(id);
 let currentInfo = null;
-let pollTimer = null;
+const activeJobs = new Map(); // jobId -> { title, card, fill, meta }
+let jobsPollTimer = null;
 
 async function api(path, opts) {
   const r = await fetch(path, {
@@ -280,7 +278,11 @@ $('dlBtn').addEventListener('click', async () => {
         }),
       }));
     }
-    startPolling(job_id, currentInfo.title);
+    trackJob(job_id, currentInfo.title);
+    // Reset the fetch form so another URL can be pasted while this one downloads.
+    $('url').value = '';
+    $('infoCard').classList.add('hidden');
+    currentInfo = null;
   } catch (e) {
     showErr($('dlErr'), e.message);
   } finally {
@@ -288,37 +290,85 @@ $('dlBtn').addEventListener('click', async () => {
   }
 });
 
-// ---- Poll job progress ----
-function startPolling(jobId, title) {
-  stopPolling();
-  $('progCard').classList.remove('hidden');
-  $('progTitle').textContent = title || 'Downloading…';
-  const tick = async () => {
+// ---- Multi-download job tracking ----
+function ensureJobsPoller() {
+  if (jobsPollTimer) return;
+  jobsPollTimer = setInterval(pollAllJobs, 1000);
+}
+
+function trackJob(jobId, title) {
+  if (activeJobs.has(jobId)) return;
+  $('jobsHeader').classList.remove('hidden');
+
+  const card = document.createElement('div');
+  card.className = 'card';
+  const titleEl = document.createElement('p');
+  titleEl.className = 'info-title';
+  titleEl.textContent = title || 'Downloading…';
+  const track = document.createElement('div');
+  track.className = 'progress-track';
+  const fill = document.createElement('div');
+  fill.className = 'progress-fill';
+  track.appendChild(fill);
+  const meta = document.createElement('p');
+  meta.className = 'progress-meta';
+  meta.textContent = 'Starting…';
+  card.appendChild(titleEl);
+  card.appendChild(track);
+  card.appendChild(meta);
+  // Newest downloads appear on top.
+  $('jobs').prepend(card);
+
+  activeJobs.set(jobId, { title: title || 'Downloading…', card, fill, meta });
+  ensureJobsPoller();
+  pollAllJobs();
+}
+
+async function pollAllJobs() {
+  if (!activeJobs.size) {
+    if (jobsPollTimer) { clearInterval(jobsPollTimer); jobsPollTimer = null; }
+    return;
+  }
+  for (const [jobId, entry] of [...activeJobs]) {
     try {
       const j = await api('/api/jobs/' + jobId);
-      $('progFill').style.width = Math.min(100, j.percent || 0) + '%';
-      $('progMeta').textContent =
-        (j.status === 'queued' ? 'Waiting for a download slot…'
-          : Math.round(j.percent || 0) + '%' + (j.speed ? ' · ' + j.speed : '') + (j.eta ? ' · ' + j.eta + ' left' : ''));
-      if (j.status === 'done') {
-        stopPolling();
-        $('progMeta').textContent = 'Done.';
-        setTimeout(() => $('progCard').classList.add('hidden'), 4000);
+      entry.fill.style.width = Math.min(100, j.percent || 0) + '%';
+      if (j.status === 'queued') {
+        entry.meta.textContent = 'Waiting for a download slot…';
+      } else if (j.status === 'downloading') {
+        entry.meta.textContent =
+          Math.round(j.percent || 0) + '%' + (j.speed ? ' · ' + j.speed : '') + (j.eta ? ' · ' + j.eta + ' left' : '');
+      } else if (j.status === 'done') {
+        entry.fill.style.width = '100%';
+        entry.meta.textContent = 'Done.' + (j.filename ? ' ' + j.filename : '');
+        activeJobs.delete(jobId);
+        setTimeout(() => { entry.card.remove(); if (!$('jobs').children.length) $('jobsHeader').classList.add('hidden'); }, 15000);
         refreshLibrary();
       } else if (j.status === 'error') {
-        stopPolling();
-        $('progMeta').textContent = 'Failed: ' + (j.error || 'unknown error');
+        entry.meta.textContent = 'Failed: ' + (j.error || 'unknown error');
+        entry.meta.classList.add('error');
+        activeJobs.delete(jobId);
       }
     } catch (e) {
-      stopPolling();
-      $('progMeta').textContent = 'Lost track of the download. Check the library.';
+      entry.meta.textContent = 'Lost track of the download. Check the library.';
+      activeJobs.delete(jobId);
     }
-  };
-  tick();
-  pollTimer = setInterval(tick, 1000);
+  }
+  if (!activeJobs.size && jobsPollTimer) {
+    clearInterval(jobsPollTimer);
+    jobsPollTimer = null;
+  }
 }
-function stopPolling() {
-  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+
+// Restore any in-flight downloads after a page reload.
+async function restoreJobs() {
+  try {
+    const { jobs } = await api('/api/jobs');
+    (jobs || [])
+      .filter((j) => j.status === 'queued' || j.status === 'downloading')
+      .reverse()
+      .forEach((j) => trackJob(j.id, j.title));
+  } catch { /* ignore */ }
 }
 
 // ---- Library ----
@@ -390,6 +440,7 @@ async function refreshLibrary() {
 }
 
 refreshLibrary();
+restoreJobs();
 
 // ---- Save folder setting ----
 async function refreshSettings() {
