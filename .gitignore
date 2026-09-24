@@ -1,4 +1,6 @@
 node_modules/
 downloads/
+bin/
+config.json
 .venv/
 *.log
