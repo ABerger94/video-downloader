@@ -11,6 +11,7 @@ const http = require('http');
 const https = require('https');
 const { deepFetch } = require('./deepfetch');
 const { stampVidsrcToken } = require('./vidsrc');
+const { parseEpisodeMeta, formatEpisodeTag, cleanNum } = require('./public/episode-meta');
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
@@ -124,6 +125,12 @@ function fmtDuration(sec) {
   return (h ? h + ':' + String(m).padStart(2, '0') : m) + ':' + String(s).padStart(2, '0');
 }
 
+// Positive int or null — for season/episode values off the wire.
+function numOr(v) {
+  const n = parseInt(v, 10);
+  return Number.isFinite(n) && n > 0 && n < 1000 ? n : null;
+}
+
 // ---------------------------------------------------------------------------
 // Jobs (in-memory). MAX_CONCURRENT run at once; the rest queue.
 // ---------------------------------------------------------------------------
@@ -144,12 +151,13 @@ function pumpQueue() {
   }
 }
 
-function newJob({ url, formatId, title, kind = 'ytdlp', streamUrl, streamType, tokenize }) {
+function newJob({ url, formatId, title, kind = 'ytdlp', streamUrl, streamType, tokenize, season, episode }) {
   const id = crypto.randomBytes(8).toString('hex');
   const job = {
     id, url: url || null, formatId: formatId || null, title: title || null,
     kind, streamUrl: streamUrl || null, streamType: streamType || null,
     tokenize: tokenize || null,
+    season: numOr(season), episode: numOr(episode),
     status: 'queued', percent: 0, speed: null, eta: null,
     filename: null, error: null, createdAt: Date.now(),
   };
@@ -167,7 +175,9 @@ const RE_ERROR = /^(?:ERROR|error):\s*(.+)/;
 function startDownload(job) {
   if (job.kind === 'deep') return startDeepDownload(job);
   job.status = 'downloading';
-  const outTpl = path.join(DOWNLOADS_DIR, '%(title).80s [%(id)s].%(ext)s');
+  // Bake S01E05-style tags into the filename when we know them.
+  const tag = formatEpisodeTag(job.season, job.episode);
+  const outTpl = path.join(DOWNLOADS_DIR, '%(title).80s' + (tag ? ' ' + tag : '') + ' [%(id)s].%(ext)s');
   const args = [
     '--newline', '--progress',
     '--no-playlist', '--no-warnings',
@@ -273,7 +283,8 @@ function startDeepDownload(job) {
   // Hold the concurrency slot immediately; the vidsrc token (short-lived,
   // IP-bound) is stamped on just before ffmpeg/ffprobe run.
   job.status = 'downloading';
-  const outPath = uniqueOutPath(sanitizeTitle(job.title));
+  const tag = formatEpisodeTag(job.season, job.episode);
+  const outPath = uniqueOutPath(sanitizeTitle(job.title) + (tag ? ' ' + tag : ''));
   job.filename = path.basename(outPath);
   const ready = (job.tokenize === 'vidsrc')
     ? stampVidsrcToken(job.streamUrl).then((u) => { job.streamUrl = u; }).catch(() => {})
@@ -506,6 +517,11 @@ app.post('/api/info', (req, res) => {
     // Single video: full info (formats, thumbnail) for the quality picker.
     runYtDlpJson(['--dump-single-json', '--no-playlist', '--no-warnings', url], (err, data) => {
       if (err) return res.status(422).json({ error: err });
+      // yt-dlp often knows the season/episode itself; fall back to parsing
+      // the page URL and title for sites where it doesn't.
+      const fromUrl = parseEpisodeMeta((data.webpage_url || url) + ' ' + (data.title || ''));
+      const season = numOr(data.season_number) || fromUrl.season;
+      const episode = numOr(data.episode_number) || fromUrl.episode;
       res.json({
         id: data.id || null,
         title: data.title || 'Untitled',
@@ -513,6 +529,8 @@ app.post('/api/info', (req, res) => {
         duration: data.duration ? fmtDuration(data.duration) : null,
         uploader: data.uploader || data.channel || null,
         webpage_url: data.webpage_url || url,
+        season, episode,
+        episode_tag: formatEpisodeTag(season, episode),
         formats: curateFormats(data.formats || []),
       });
     });
@@ -549,13 +567,17 @@ function playlistPayload(data, entries, url) {
   const extractor = data.extractor_key || data.extractor || '';
   const items = [];
   entries.slice(0, 200).forEach((e, i) => {
+    const pageUrl = entryPageUrl(e, extractor);
+    const em = parseEpisodeMeta((pageUrl || '') + ' ' + (e.title || ''));
     items.push({
       index: i,
       id: e.id || null,
       title: e.title || ('Video ' + (i + 1)),
       duration: e.duration ? fmtDuration(e.duration) : null,
       uploader: e.uploader || e.channel || null,
-      page_url: entryPageUrl(e, extractor),
+      page_url: pageUrl,
+      season: numOr(e.season_number) || em.season,
+      episode: numOr(e.episode_number) || em.episode,
     });
   });
   return {
@@ -622,9 +644,9 @@ function curateFormats(formats) {
   return out;
 }
 
-// POST /api/download {url, format_id, title?} -> {job_id}
+// POST /api/download {url, format_id, title?, season?, episode?} -> {job_id}
 app.post('/api/download', (req, res) => {
-  const { url, format_id, title } = req.body || {};
+  const { url, format_id, title, season, episode } = req.body || {};
   if (!validUrl(url)) return res.status(400).json({ error: 'Give me a valid http(s) URL.' });
   // format_id is passed as a single argv element (no shell), so yt-dlp
   // format-selector syntax (*, <, >, /, !, ?, ~, ^, $, |) is safe here.
@@ -635,6 +657,7 @@ app.post('/api/download', (req, res) => {
     url,
     formatId: format_id.trim(),
     title: typeof title === 'string' ? title.slice(0, 200) : null,
+    season, episode,
   });
   res.json({ job_id: job.id, status: job.status });
 });
@@ -648,15 +671,16 @@ app.post('/api/deep-info', async (req, res) => {
     if (!result.candidates.length) {
       return res.status(422).json({ error: 'Deep fetch found no playable streams on that page.' + (result.note ? ' ' + result.note : '') });
     }
-    res.json(result);
+    const em = parseEpisodeMeta(url + ' ' + (result.title || ''));
+    res.json({ ...result, season: em.season, episode: em.episode, episode_tag: formatEpisodeTag(em.season, em.episode) });
   } catch (e) {
     res.status(500).json({ error: 'Deep fetch failed: ' + (e.message || 'browser error') });
   }
 });
 
-// POST /api/deep-download {streamUrl, type: 'hls'|'mp4', title?, tokenize?} -> {job_id}
+// POST /api/deep-download {streamUrl, type: 'hls'|'mp4', title?, tokenize?, season?, episode?} -> {job_id}
 app.post('/api/deep-download', (req, res) => {
-  const { streamUrl, type, title, tokenize } = req.body || {};
+  const { streamUrl, type, title, tokenize, season, episode } = req.body || {};
   if (!validUrl(streamUrl)) return res.status(400).json({ error: 'Bad stream URL.' });
   if (type !== 'hls' && type !== 'mp4') return res.status(400).json({ error: 'Unknown stream type.' });
   const job = newJob({
@@ -664,6 +688,7 @@ app.post('/api/deep-download', (req, res) => {
     streamUrl,
     streamType: type,
     title: typeof title === 'string' ? title.slice(0, 200) : null,
+    season, episode,
     // tokenize: 'vidsrc' — stamp a fresh short-lived token at download time.
     tokenize: tokenize === 'vidsrc' ? 'vidsrc' : null,
   });
@@ -677,7 +702,7 @@ app.get('/api/jobs', (req, res) => {
     .map((j) => ({
       id: j.id, status: j.status, percent: j.percent, speed: j.speed,
       eta: j.eta, title: j.title, filename: j.filename, error: j.error,
-      createdAt: j.createdAt,
+      season: j.season, episode: j.episode, createdAt: j.createdAt,
     }));
   res.json({ jobs: list });
 });
@@ -686,8 +711,8 @@ app.get('/api/jobs', (req, res) => {
 app.get('/api/jobs/:id', (req, res) => {
   const job = jobs.get(req.params.id);
   if (!job) return res.status(404).json({ error: 'Unknown job.' });
-  const { id, status, percent, speed, eta, title, filename, error, createdAt } = job;
-  res.json({ id, status, percent, speed, eta, title, filename, error, createdAt });
+  const { id, status, percent, speed, eta, title, filename, error, season, episode, createdAt } = job;
+  res.json({ id, status, percent, speed, eta, title, filename, error, season, episode, createdAt });
 });
 
 // GET /api/files -> completed downloads
