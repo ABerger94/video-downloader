@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>Video Downloader</title>
+<style>
+  :root {
+    --bg: #0e1116;
+    --card: #171c24;
+    --border: #262d38;
+    --text: #e8ecf1;
+    --muted: #9aa4b2;
+    --accent: #4f8ef7;
+    --accent-dim: #2b4f8f;
+    --danger: #e5484d;
+    --success: #46a758;
+    --radius: 12px;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    font-size: 16px;
+    line-height: 1.45;
+  }
+  .wrap { max-width: 640px; margin: 0 auto; padding: 16px 16px 64px; }
+  h1 { font-size: 22px; margin: 8px 0 16px; letter-spacing: -0.3px; }
+  h2 { font-size: 16px; margin: 24px 0 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.8px; }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 14px;
+    margin-bottom: 12px;
+  }
+  .row { display: flex; gap: 10px; }
+  input[type="url"], input[type="text"], select {
+    width: 100%;
+    background: #0c0f14;
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 10px;
+    padding: 12px;
+    font-size: 16px;
+    outline: none;
+  }
+  input:focus, select:focus { border-color: var(--accent); }
+  button {
+    background: var(--accent);
+    color: #fff;
+    border: none;
+    border-radius: 10px;
+    padding: 12px 18px;
+    font-size: 16px;
+    font-weight: 600;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  button:disabled { background: var(--accent-dim); cursor: default; }
+  button.ghost { background: transparent; border: 1px solid var(--border); color: var(--text); }
+  button.danger { background: transparent; border: 1px solid var(--danger); color: var(--danger); }
+  .hidden { display: none !important; }
+  .info-card { display: flex; gap: 12px; }
+  .info-card img {
+    width: 120px; height: 68px; object-fit: cover; border-radius: 8px;
+    background: #0c0f14; flex-shrink: 0;
+  }
+  .info-title { font-weight: 600; font-size: 15px; margin: 0 0 4px; }
+  .info-meta { color: var(--muted); font-size: 13px; margin: 0; }
+  .quality-row { display: flex; gap: 10px; margin-top: 12px; }
+  .quality-row select { flex: 1; }
+  .progress-track {
+    background: #0c0f14; border: 1px solid var(--border);
+    border-radius: 8px; height: 22px; overflow: hidden; margin: 10px 0 6px;
+  }
+  .progress-fill {
+    height: 100%; width: 0%;
+    background: linear-gradient(90deg, var(--accent-dim), var(--accent));
+    transition: width 0.4s;
+  }
+  .progress-meta { color: var(--muted); font-size: 13px; margin: 0; }
+  .error { color: var(--danger); font-size: 14px; margin: 8px 0 0; }
+  .lib-row {
+    display: flex; align-items: center; gap: 10px;
+    padding: 10px 0; border-bottom: 1px solid var(--border);
+  }
+  .lib-row:last-child { border-bottom: none; }
+  .lib-name { flex: 1; min-width: 0; }
+  .lib-name .t {
+    font-size: 14px; font-weight: 500;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .lib-name .s { font-size: 12px; color: var(--muted); }
+  .lib-actions { display: flex; gap: 6px; flex-shrink: 0; }
+  .lib-actions button, .lib-actions a {
+    padding: 8px 10px; font-size: 13px; border-radius: 8px; text-decoration: none;
+  }
+  .lib-actions a { background: transparent; border: 1px solid var(--border); color: var(--text); }
+  .player { width: 100%; border-radius: 8px; margin-top: 8px; background: #000; }
+  .empty { color: var(--muted); font-size: 14px; text-align: center; padding: 18px 0; }
+  .status { color: var(--muted); font-size: 13px; margin: 8px 0 0; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Video Downloader</h1>
+
+  <!-- URL input -->
+  <div class="card">
+    <div class="row">
+      <input type="url" id="url" inputmode="url" placeholder="Paste a video URL…" autocomplete="off">
+      <button id="fetchBtn">Fetch</button>
+    </div>
+    <p class="error hidden" id="fetchErr"></p>
+  </div>
+
+  <!-- Video info + quality picker -->
+  <div class="card hidden" id="infoCard">
+    <div class="info-card">
+      <img id="thumb" alt="">
+      <div>
+        <p class="info-title" id="vTitle"></p>
+        <p class="info-meta" id="vMeta"></p>
+      </div>
+    </div>
+    <div class="quality-row">
+      <select id="quality"></select>
+      <button id="dlBtn">Download</button>
+    </div>
+    <p class="error hidden" id="dlErr"></p>
+  </div>
+
+  <!-- Active download progress -->
+  <div class="card hidden" id="progCard">
+    <p class="info-title" id="progTitle">Downloading…</p>
+    <div class="progress-track"><div class="progress-fill" id="progFill"></div></div>
+    <p class="progress-meta" id="progMeta">Starting…</p>
+  </div>
+
+  <!-- Library -->
+  <h2>Library</h2>
+  <div class="card" id="libCard">
+    <div id="libList"><p class="empty">Nothing downloaded yet.</p></div>
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let currentInfo = null;
+let pollTimer = null;
+
+async function api(path, opts) {
+  const r = await fetch(path, {
+    headers: { 'Content-Type': 'application/json' },
+    ...opts,
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || ('Request failed (' + r.status + ')'));
+  return data;
+}
+
+function showErr(el, msg) {
+  el.textContent = msg;
+  el.classList.remove('hidden');
+}
+function hideErr(el) { el.classList.add('hidden'); }
+
+// ---- Fetch video info ----
+$('fetchBtn').addEventListener('click', async () => {
+  const url = $('url').value.trim();
+  hideErr($('fetchErr'));
+  if (!url) return showErr($('fetchErr'), 'Paste a URL first.');
+  $('fetchBtn').disabled = true;
+  $('fetchBtn').textContent = '…';
+  try {
+    const info = await api('/api/info', { method: 'POST', body: JSON.stringify({ url }) });
+    currentInfo = info;
+    $('thumb').src = info.thumbnail || '';
+    $('vTitle').textContent = info.title || 'Untitled';
+    $('vMeta').textContent = [info.uploader, info.duration].filter(Boolean).join(' · ');
+    const q = $('quality');
+    q.innerHTML = '';
+    (info.formats || []).forEach((f) => {
+      const o = document.createElement('option');
+      o.value = f.id;
+      o.textContent = f.label + (f.size ? ' — ' + f.size : '');
+      q.appendChild(o);
+    });
+    $('infoCard').classList.remove('hidden');
+    hideErr($('dlErr'));
+  } catch (e) {
+    showErr($('fetchErr'), e.message);
+    $('infoCard').classList.add('hidden');
+  } finally {
+    $('fetchBtn').disabled = false;
+    $('fetchBtn').textContent = 'Fetch';
+  }
+});
+
+// ---- Start download ----
+$('dlBtn').addEventListener('click', async () => {
+  if (!currentInfo) return;
+  hideErr($('dlErr'));
+  $('dlBtn').disabled = true;
+  try {
+    const { job_id } = await api('/api/download', {
+      method: 'POST',
+      body: JSON.stringify({
+        url: currentInfo.webpage_url,
+        format_id: $('quality').value,
+        title: currentInfo.title,
+      }),
+    });
+    startPolling(job_id, currentInfo.title);
+  } catch (e) {
+    showErr($('dlErr'), e.message);
+  } finally {
+    $('dlBtn').disabled = false;
+  }
+});
+
+// ---- Poll job progress ----
+function startPolling(jobId, title) {
+  stopPolling();
+  $('progCard').classList.remove('hidden');
+  $('progTitle').textContent = title || 'Downloading…';
+  const tick = async () => {
+    try {
+      const j = await api('/api/jobs/' + jobId);
+      $('progFill').style.width = Math.min(100, j.percent || 0) + '%';
+      $('progMeta').textContent =
+        (j.status === 'queued' ? 'Waiting for a download slot…'
+          : Math.round(j.percent || 0) + '%' + (j.speed ? ' · ' + j.speed : '') + (j.eta ? ' · ' + j.eta + ' left' : ''));
+      if (j.status === 'done') {
+        stopPolling();
+        $('progMeta').textContent = 'Done.';
+        setTimeout(() => $('progCard').classList.add('hidden'), 4000);
+        refreshLibrary();
+      } else if (j.status === 'error') {
+        stopPolling();
+        $('progMeta').textContent = 'Failed: ' + (j.error || 'unknown error');
+      }
+    } catch (e) {
+      stopPolling();
+      $('progMeta').textContent = 'Lost track of the download. Check the library.';
+    }
+  };
+  tick();
+  pollTimer = setInterval(tick, 1000);
+}
+function stopPolling() {
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+}
+
+// ---- Library ----
+async function refreshLibrary() {
+  const list = $('libList');
+  try {
+    const { files } = await api('/api/files');
+    if (!files.length) {
+      list.innerHTML = '<p class="empty">Nothing downloaded yet.</p>';
+      return;
+    }
+    list.innerHTML = '';
+    files.forEach((f) => {
+      const row = document.createElement('div');
+      row.className = 'lib-row';
+      const name = document.createElement('div');
+      name.className = 'lib-name';
+      const t = document.createElement('div');
+      t.className = 't';
+      t.textContent = f.name;
+      const s = document.createElement('div');
+      s.className = 's';
+      s.textContent = f.size_h + ' · ' + new Date(f.mtime).toLocaleString();
+      name.appendChild(t); name.appendChild(s);
+
+      const actions = document.createElement('div');
+      actions.className = 'lib-actions';
+
+      const play = document.createElement('button');
+      play.className = 'ghost';
+      play.textContent = 'Play';
+      const playerWrap = document.createElement('div');
+      play.addEventListener('click', () => {
+        if (playerWrap.firstChild) { playerWrap.innerHTML = ''; return; }
+        const v = document.createElement('video');
+        v.className = 'player';
+        v.controls = true;
+        v.preload = 'metadata';
+        v.src = '/api/file/' + encodeURIComponent(f.name);
+        playerWrap.appendChild(v);
+        v.play().catch(() => {});
+      });
+
+      const save = document.createElement('a');
+      save.href = '/api/file/' + encodeURIComponent(f.name);
+      save.setAttribute('download', f.name);
+      save.textContent = 'Save';
+
+      const del = document.createElement('button');
+      del.className = 'danger';
+      del.textContent = 'Delete';
+      del.addEventListener('click', async () => {
+        if (!confirm('Delete this file?')) return;
+        try {
+          await api('/api/file/' + encodeURIComponent(f.name), { method: 'DELETE' });
+          refreshLibrary();
+        } catch (e) { alert(e.message); }
+      });
+
+      actions.appendChild(play); actions.appendChild(save); actions.appendChild(del);
+      row.appendChild(name); row.appendChild(actions);
+      const wrap = document.createElement('div');
+      wrap.appendChild(row); wrap.appendChild(playerWrap);
+      list.appendChild(wrap);
+    });
+  } catch (e) {
+    list.innerHTML = '<p class="empty">Could not load the library.</p>';
+  }
+}
+
+refreshLibrary();
+</script>
+</body>
+</html>

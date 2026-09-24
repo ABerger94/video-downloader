@@ -1,0 +1,12 @@
+# Nixpacks build config for Railway.
+# The Node.js provider handles npm install automatically; we just add
+# python3 + ffmpeg to the setup phase and install yt-dlp via pip.
+
+[phases.setup]
+nixPkgs = ["python3", "ffmpeg"]
+
+[phases.install]
+cmds = ["npm ci", "pip install -r requirements.txt"]
+
+[start]
+cmd = "node server.js"
