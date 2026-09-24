@@ -161,12 +161,13 @@ function pumpQueue() {
   }
 }
 
-function newJob({ url, formatId, title, kind = 'ytdlp', streamUrl, streamType, tokenize, season, episode }) {
+function newJob({ url, formatId, title, kind = 'ytdlp', streamUrl, streamType, tokenize, season, episode, referer }) {
   const id = crypto.randomBytes(8).toString('hex');
   const job = {
     id, url: url || null, formatId: formatId || null, title: title || null,
     kind, streamUrl: streamUrl || null, streamType: streamType || null,
     tokenize: tokenize || null,
+    referer: referer || null,
     season: numOr(season), episode: numOr(episode),
     status: 'queued', percent: 0, speed: null, eta: null,
     filename: null, error: null, createdAt: Date.now(),
@@ -313,36 +314,39 @@ function ffmpegProxyArgs() {
   return p ? ['-http_proxy', p] : [];
 }
 
-// Some HLS proxy URLs (e.g. VidEasy's netocdn proxy) carry required
-// Origin/Referer in a base64 `data` query param:
-//   data=base64("Origin=https://x|Referer=https://x/")
-// Decode it into ffmpeg -headers so the stream server doesn't 403 us.
-function streamHeadersArgs(streamUrl) {
+// Merge the base64 `data`-param headers with the job's Referer (the player
+// embed page the stream was discovered on) into a single ffmpeg -headers
+// arg. Stream hosts on the 7reels embeds 403/404 without a Referer.
+function deepHeadersArgs(job) {
+  const lines = [];
   try {
-    const data = new URL(streamUrl).searchParams.get('data');
-    if (!data) return [];
-    const decoded = Buffer.from(data, 'base64').toString('utf8');
-    const headers = [];
-    for (const part of decoded.split('|')) {
-      const eq = part.indexOf('=');
-      if (eq > 0) {
-        const k = part.slice(0, eq).trim(), v = part.slice(eq + 1).trim();
-        if (/^(origin|referer)$/i.test(k) && /^https?:\/\//i.test(v)) {
-          headers.push(`${k}: ${v}`);
+    const data = new URL(job.streamUrl).searchParams.get('data');
+    if (data) {
+      const decoded = Buffer.from(data, 'base64').toString('utf8');
+      for (const part of decoded.split('|')) {
+        const eq = part.indexOf('=');
+        if (eq > 0) {
+          const k = part.slice(0, eq).trim(), v = part.slice(eq + 1).trim();
+          if (/^(origin|referer)$/i.test(k) && /^https?:\/\//i.test(v)) {
+            lines.push(`${k}: ${v}`);
+          }
         }
       }
     }
-    if (!headers.length) return [];
-    return ['-headers', headers.map((h) => h + '\r\n').join('')];
-  } catch {
-    return [];
+  } catch { /* keep going */ }
+  if (job.referer && /^https?:\/\//i.test(job.referer) &&
+      !lines.some((l) => /^referer:/i.test(l))) {
+    lines.push(`Referer: ${job.referer}`);
   }
+  if (!lines.length) return [];
+  return ['-headers', lines.map((h) => h + '\r\n').join('')];
 }
 
-function ffprobeDuration(url) {
+function ffprobeDuration(job) {
+  const url = job.streamUrl;
   return new Promise((resolve) => {
     const child = spawn(FFPROBE, [
-      '-v', 'error', ...ffmpegProxyArgs(), ...streamHeadersArgs(url),
+      '-v', 'error', ...ffmpegProxyArgs(), ...deepHeadersArgs(job),
       '-show_entries', 'format=duration',
       '-of', 'default=noprint_wrappers=1:nokey=1', url,
     ], { timeout: 30000 });
@@ -359,11 +363,11 @@ function ffprobeDuration(url) {
 const RE_FFMPEG_TIME = /time=(\d+):(\d+):([\d.]+)/;
 
 async function startHlsDownload(job, outPath) {
-  const duration = await ffprobeDuration(job.streamUrl);
+  const duration = await ffprobeDuration(job);
   const args = [
     '-hide_banner', '-y',
     ...ffmpegProxyArgs(),
-    ...streamHeadersArgs(job.streamUrl),
+    ...deepHeadersArgs(job),
     '-rw_timeout', '15000000', // 15s stall timeout (microseconds)
     '-i', job.streamUrl,
     '-c', 'copy', '-bsf:a', 'aac_adtstoasc',
@@ -440,8 +444,10 @@ function startHttpDownload(job, outPath) {
     pumpQueue();
   };
 
+  const dlHeaders = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' };
+  if (job.referer && /^https?:\/\//i.test(job.referer)) dlHeaders.Referer = job.referer;
   const req = mod.get(job.streamUrl, {
-    headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
+    headers: dlHeaders,
     timeout: 30000,
   }, (res) => {
     // Follow one redirect level (CDNs love these).
@@ -688,9 +694,9 @@ app.post('/api/deep-info', async (req, res) => {
   }
 });
 
-// POST /api/deep-download {streamUrl, type: 'hls'|'mp4', title?, tokenize?, season?, episode?} -> {job_id}
+// POST /api/deep-download {streamUrl, type: 'hls'|'mp4', title?, tokenize?, season?, episode?, referer?} -> {job_id}
 app.post('/api/deep-download', (req, res) => {
-  const { streamUrl, type, title, tokenize, season, episode } = req.body || {};
+  const { streamUrl, type, title, tokenize, season, episode, referer } = req.body || {};
   if (!validUrl(streamUrl)) return res.status(400).json({ error: 'Bad stream URL.' });
   if (type !== 'hls' && type !== 'mp4') return res.status(400).json({ error: 'Unknown stream type.' });
   const job = newJob({
@@ -699,6 +705,7 @@ app.post('/api/deep-download', (req, res) => {
     streamType: type,
     title: typeof title === 'string' ? title.slice(0, 200) : null,
     season, episode,
+    referer: typeof referer === 'string' && validUrl(referer) ? referer : null,
     // tokenize: 'vidsrc' — stamp a fresh short-lived token at download time.
     tokenize: tokenize === 'vidsrc' ? 'vidsrc' : null,
   });
