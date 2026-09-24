@@ -108,6 +108,22 @@
   .player { width: 100%; border-radius: 8px; margin-top: 8px; background: #000; }
   .empty { color: var(--muted); font-size: 14px; text-align: center; padding: 18px 0; }
   .status { color: var(--muted); font-size: 13px; margin: 8px 0 0; }
+  .pl-list {
+    max-height: 320px; overflow-y: auto;
+    border: 1px solid var(--border); border-radius: 8px; margin-bottom: 12px;
+  }
+  .pl-row {
+    display: flex; gap: 10px; align-items: center;
+    padding: 9px 10px; border-bottom: 1px solid var(--border); font-size: 14px;
+  }
+  .pl-row:last-child { border-bottom: none; }
+  .pl-row input[type="checkbox"] { width: 18px; height: 18px; flex-shrink: 0; }
+  .pl-row .t { flex: 1; min-width: 0; }
+  .pl-row .tt { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-weight: 500; }
+  .pl-row .tm { font-size: 12px; color: var(--muted); }
+  .pl-row.unavail { opacity: 0.45; }
+  .pl-tools { display: flex; gap: 10px; margin: 10px 0; }
+  .pl-tools button { flex: 1; padding: 9px 10px; font-size: 14px; }
 </style>
 </head>
 <body>
@@ -143,6 +159,22 @@
     <p class="error hidden" id="dlErr"></p>
   </div>
 
+  <!-- Playlist: pick which videos to download -->
+  <div class="card hidden" id="playlistCard">
+    <p class="info-title" id="plTitle"></p>
+    <p class="info-meta" id="plMeta"></p>
+    <div class="pl-tools">
+      <button class="ghost" id="plAll">Select all</button>
+      <button class="ghost" id="plNone">Select none</button>
+    </div>
+    <div class="pl-list" id="plList"></div>
+    <div class="quality-row">
+      <select id="plQuality"></select>
+      <button id="plDlBtn">Download selected</button>
+    </div>
+    <p class="error hidden" id="plErr"></p>
+  </div>
+
   <!-- Active downloads (multiple at once) -->
   <h2 id="jobsHeader" class="hidden">Downloads</h2>
   <div id="jobs"></div>
@@ -158,6 +190,7 @@
 <script>
 const $ = (id) => document.getElementById(id);
 let currentInfo = null;
+let currentPlaylist = null;
 const activeJobs = new Map(); // jobId -> { title, card, fill, meta }
 let jobsPollTimer = null;
 
@@ -186,13 +219,24 @@ $('fetchBtn').addEventListener('click', async () => {
   $('fetchBtn').textContent = '…';
   try {
     const info = await api('/api/info', { method: 'POST', body: JSON.stringify({ url }) });
-    currentInfo = info;
-    fillInfoCard(info);
     hideErr($('dlErr'));
+    hideErr($('plErr'));
+    if (info.playlist) {
+      currentInfo = null;
+      currentPlaylist = info;
+      $('infoCard').classList.add('hidden');
+      fillPlaylistCard(info);
+    } else {
+      currentInfo = info;
+      currentPlaylist = null;
+      $('playlistCard').classList.add('hidden');
+      fillInfoCard(info);
+    }
     $('deepRow').classList.add('hidden');
   } catch (e) {
     showErr($('fetchErr'), e.message);
     $('infoCard').classList.add('hidden');
+    $('playlistCard').classList.add('hidden');
     // yt-dlp can't read this site — offer the headless-browser deep fetch.
     if (/unsupported url/i.test(e.message)) {
       $('deepRow').classList.remove('hidden');
@@ -222,6 +266,119 @@ function fillInfoCard(info) {
   $('infoCard').classList.remove('hidden');
 }
 
+// ---- Playlist: list every video, let the user pick which to download ----
+// Generic quality presets (per-video format ids don't transfer across videos,
+// so playlists use yt-dlp format-selector expressions instead).
+const PL_QUALITIES = [
+  { id: 'best', label: 'Best available (auto)' },
+  { id: 'bv*[ext=mp4][height<=1080]+ba[ext=m4a]/b[ext=mp4][height<=1080]/b[height<=1080]/best', label: 'Up to 1080p (MP4)' },
+  { id: 'bv*[ext=mp4][height<=720]+ba[ext=m4a]/b[ext=mp4][height<=720]/b[height<=720]/best', label: 'Up to 720p (MP4)' },
+  { id: 'bv*[ext=mp4][height<=480]+ba[ext=m4a]/b[ext=mp4][height<=480]/b[height<=480]/best', label: 'Up to 480p (MP4)' },
+  { id: 'bestaudio[ext=m4a]/bestaudio/best', label: 'Audio only' },
+];
+
+function fillPlaylistCard(info) {
+  $('plTitle').textContent = info.title || 'Playlist';
+  const extra = info.total_count > info.count ? ' (showing first ' + info.count + ')' : '';
+  $('plMeta').textContent = info.count + ' video' + (info.count === 1 ? '' : 's') + extra +
+    (info.uploader ? ' · ' + info.uploader : '');
+
+  const q = $('plQuality');
+  q.innerHTML = '';
+  PL_QUALITIES.forEach((f) => {
+    const o = document.createElement('option');
+    o.value = f.id;
+    o.textContent = f.label;
+    q.appendChild(o);
+  });
+
+  const list = $('plList');
+  list.innerHTML = '';
+  (info.items || []).forEach((item) => {
+    const row = document.createElement('label');
+    row.className = 'pl-row' + (item.page_url ? '' : ' unavail');
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = !!item.page_url;
+    cb.disabled = !item.page_url;
+    cb.dataset.index = item.index;
+    cb.addEventListener('change', updatePlDlLabel);
+    const t = document.createElement('div');
+    t.className = 't';
+    const tt = document.createElement('div');
+    tt.className = 'tt';
+    tt.textContent = item.title;
+    const tm = document.createElement('div');
+    tm.className = 'tm';
+    tm.textContent = [item.uploader, item.duration, item.page_url ? '' : 'link unavailable']
+      .filter(Boolean).join(' · ');
+    t.appendChild(tt);
+    t.appendChild(tm);
+    row.appendChild(cb);
+    row.appendChild(t);
+    list.appendChild(row);
+  });
+
+  updatePlDlLabel();
+  $('playlistCard').classList.remove('hidden');
+}
+
+function plSelectedItems() {
+  if (!currentPlaylist) return [];
+  const checked = new Set(
+    [...$('plList').querySelectorAll('input[type="checkbox"]:checked')].map((cb) => parseInt(cb.dataset.index, 10))
+  );
+  return (currentPlaylist.items || []).filter((it) => checked.has(it.index) && it.page_url);
+}
+
+function updatePlDlLabel() {
+  const n = plSelectedItems().length;
+  $('plDlBtn').textContent = n ? 'Download selected (' + n + ')' : 'Download selected';
+  $('plDlBtn').disabled = n === 0;
+}
+
+$('plAll').addEventListener('click', () => {
+  $('plList').querySelectorAll('input[type="checkbox"]:not(:disabled)').forEach((cb) => { cb.checked = true; });
+  updatePlDlLabel();
+});
+$('plNone').addEventListener('click', () => {
+  $('plList').querySelectorAll('input[type="checkbox"]').forEach((cb) => { cb.checked = false; });
+  updatePlDlLabel();
+});
+
+// Queue one download job per selected video; the Downloads section tracks them all.
+$('plDlBtn').addEventListener('click', async () => {
+  const items = plSelectedItems();
+  if (!items.length) return;
+  hideErr($('plErr'));
+  $('plDlBtn').disabled = true;
+  const formatId = $('plQuality').value;
+  let queued = 0, failed = 0;
+  for (const item of items) {
+    try {
+      const { job_id } = await api('/api/download', {
+        method: 'POST',
+        body: JSON.stringify({ url: item.page_url, format_id: formatId, title: item.title }),
+      });
+      trackJob(job_id, item.title);
+      queued++;
+    } catch (e) {
+      failed++;
+    }
+  }
+  $('plDlBtn').disabled = false;
+  updatePlDlLabel();
+  if (failed && !queued) {
+    showErr($('plErr'), 'Could not queue the selected videos. Try again.');
+  } else {
+    // Reset the form so another URL can be pasted while these download.
+    $('url').value = '';
+    $('playlistCard').classList.add('hidden');
+    currentPlaylist = null;
+    if (failed) showErr($('plErr'), queued + ' queued, ' + failed + ' failed to queue.');
+  }
+});
+
 // ---- Deep fetch (headless browser stream sniffing) ----
 $('deepBtn').addEventListener('click', async () => {
   const url = $('url').value.trim();
@@ -245,6 +402,8 @@ $('deepBtn').addEventListener('click', async () => {
     fillInfoCard(info);
     hideErr($('dlErr'));
     $('deepRow').classList.add('hidden');
+    $('playlistCard').classList.add('hidden');
+    currentPlaylist = null;
   } catch (e) {
     showErr($('fetchErr'), e.message);
     $('deepStatus').textContent = '';
