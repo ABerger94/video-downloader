@@ -474,7 +474,7 @@ $('dlBtn').addEventListener('click', async () => {
       if (!cand) throw new Error('Pick a stream first.');
       ({ job_id } = await api('/api/deep-download', {
         method: 'POST',
-        body: JSON.stringify({ streamUrl: cand.url, type: cand.type, title: currentInfo.title, tokenize: cand.tokenize || null, season, episode, referer: cand.referer || null }),
+        body: JSON.stringify({ streamUrl: cand.url, type: cand.type, title: currentInfo.title, tokenize: cand.tokenize || null, season, episode, referer: cand.referer || null, cookies: cand.cookies || null }),
       }));
     } else {
       ({ job_id } = await api('/api/download', {
