@@ -602,6 +602,18 @@ app.post('/api/deep-download', (req, res) => {
   res.json({ job_id: job.id, status: job.status });
 });
 
+// GET /api/jobs -> list all jobs (newest first) for multi-download UI
+app.get('/api/jobs', (req, res) => {
+  const list = [...jobs.values()]
+    .sort((a, b) => b.createdAt - a.createdAt)
+    .map((j) => ({
+      id: j.id, status: j.status, percent: j.percent, speed: j.speed,
+      eta: j.eta, title: j.title, filename: j.filename, error: j.error,
+      createdAt: j.createdAt,
+    }));
+  res.json({ jobs: list });
+});
+
 // GET /api/jobs/:id -> job status (poll this)
 app.get('/api/jobs/:id', (req, res) => {
   const job = jobs.get(req.params.id);
