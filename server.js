@@ -11,7 +11,17 @@ const http = require('http');
 const https = require('https');
 const { deepFetch } = require('./deepfetch');
 const { stampVidsrcToken } = require('./vidsrc');
-const { parseEpisodeMeta, formatEpisodeTag, cleanNum } = require('./public/episode-meta');
+// episode-meta.js lives in public/ (it doubles as a browser <script>).
+// If it's missing, fall back to no-op parsing so the server still runs.
+let parseEpisodeMeta, formatEpisodeTag, cleanNum;
+try {
+  ({ parseEpisodeMeta, formatEpisodeTag, cleanNum } = require('./public/episode-meta'));
+} catch {
+  parseEpisodeMeta = () => ({ season: null, episode: null });
+  formatEpisodeTag = () => null;
+  cleanNum = () => null;
+  console.log('episode-meta.js not found in public/ — season/episode URL parsing disabled.');
+}
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
