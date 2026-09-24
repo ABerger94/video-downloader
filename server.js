@@ -362,7 +362,42 @@ function ffprobeDuration(job) {
 
 const RE_FFMPEG_TIME = /time=(\d+):(\d+):([\d.]+)/;
 
+// Quick pre-flight: fetch just the response headers of the stream URL.
+// When a provider hands back an HTML error page (expired/blocked link)
+// instead of a playlist, fail fast with a plain message instead of
+// ffmpeg's cryptic "Invalid data found when processing input".
+function probeStreamHeaders(job) {
+  return new Promise((resolve) => {
+    const mod = job.streamUrl.startsWith('https:') ? https : http;
+    const headers = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' };
+    if (job.referer && /^https?:\/\//i.test(job.referer)) headers.Referer = job.referer;
+    let done = false;
+    const finish = (r) => { if (!done) { done = true; resolve(r); } };
+    const req = mod.get(job.streamUrl, { headers, timeout: 15000 }, (res) => {
+      const ct = String(res.headers['content-type'] || '').toLowerCase();
+      res.resume();
+      res.on('end', () => finish({ status: res.statusCode, contentType: ct }));
+      res.on('close', () => finish({ status: res.statusCode, contentType: ct }));
+    });
+    req.on('timeout', () => { req.destroy(); finish({ status: 0, contentType: '' }); });
+    req.on('error', () => finish({ status: 0, contentType: '' }));
+  });
+}
+
 async function startHlsDownload(job, outPath) {
+  const probe = await probeStreamHeaders(job);
+  if (probe.status !== 200) {
+    job.status = 'error';
+    job.error = 'Stream server returned HTTP ' + probe.status + '. The link may have expired — re-run the deep fetch and download right away.';
+    pumpQueue();
+    return;
+  }
+  if (/text\/html/.test(probe.contentType)) {
+    job.status = 'error';
+    job.error = 'Stream link returned a web page instead of video (expired or blocked). Re-run the deep fetch and download right away — if it persists, try a different stream in the list.';
+    pumpQueue();
+    return;
+  }
   const duration = await ffprobeDuration(job);
   const args = [
     '-hide_banner', '-y',
