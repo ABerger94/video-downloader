@@ -1,12 +1,21 @@
 # Nixpacks build config for Railway.
-# The Node.js provider handles npm install automatically; we just add
-# python3 + ffmpeg to the setup phase and install yt-dlp via pip.
+# The Node.js provider handles npm install automatically; we add python3 +
+# ffmpeg to the setup phase, install yt-dlp via pip, and let Playwright
+# install its own Chromium + OS deps (apt) in a dedicated build phase.
+# Playwright detects the Debian version itself, so we don't hardcode lib names.
 
 [phases.setup]
 nixPkgs = ["python3", "ffmpeg"]
 
 [phases.install]
-cmds = ["npm ci", "pip install -r requirements.txt"]
+# PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD keeps `npm ci` from triggering Playwright's
+# postinstall browser fetch; the dedicated browser phase installs Chromium
+# deliberately right after.
+cmds = ["PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm ci", "pip install -r requirements.txt"]
+
+[phases.browser]
+dependsOn = ["install"]
+cmds = ["PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright ./node_modules/.bin/playwright install --with-deps chromium"]
 
 [start]
-cmd = "node server.js"
+cmd = "PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright node server.js"
