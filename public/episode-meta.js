@@ -26,8 +26,9 @@
   function parseEpisodeMeta(input) {
     const out = { season: null, episode: null };
     if (!input || typeof input !== 'string') return out;
-    // Query-string spaces often arrive as +; treat them as spaces.
-    const str = input.replace(/[+]/g, ' ');
+    // Query-string bits arrive as +/&/= (e.g. ?season=1&episode=1);
+    // treat them all as separators.
+    const str = input.replace(/[+&=]/g, ' ');
     let m;
 
     // 1. S01E02 / s1e2 / S1-E2
