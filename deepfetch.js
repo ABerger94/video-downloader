@@ -226,6 +226,20 @@ async function deepFetchOnce(pageUrl) {
         } catch { /* keep walking */ }
       }
       if (found.size === 0) await walkEmbeds(embeds);
+
+      // Borrow the browser's cookies (Cloudflare clearance etc.) for the
+      // embed origins: ffmpeg can't pass those challenges on its own.
+      const cookieCache = {};
+      for (const cand of found.values()) {
+        if (!cand.referer || cand.cookies) continue;
+        let origin;
+        try { origin = new URL(cand.referer).origin; } catch { continue; }
+        if (!(origin in cookieCache)) {
+          const list = await page.context().cookies(origin).catch(() => []);
+          cookieCache[origin] = list.map(c => `${c.name}=${c.value}`).join('; ');
+        }
+        if (cookieCache[origin]) cand.cookies = cookieCache[origin];
+      }
     }
 
     if (found.size === 0) {
