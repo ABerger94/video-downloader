@@ -338,6 +338,10 @@ function deepHeadersArgs(job) {
       !lines.some((l) => /^referer:/i.test(l))) {
     lines.push(`Referer: ${job.referer}`);
   }
+  if (job.cookies && typeof job.cookies === 'string' && job.cookies.length < 4096 &&
+      !lines.some((l) => /^cookie:/i.test(l))) {
+    lines.push(`Cookie: ${job.cookies}`);
+  }
   if (!lines.length) return [];
   return ['-headers', lines.map((h) => h + '\r\n').join('')];
 }
@@ -371,6 +375,7 @@ function probeStreamHeaders(job) {
     const mod = job.streamUrl.startsWith('https:') ? https : http;
     const headers = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' };
     if (job.referer && /^https?:\/\//i.test(job.referer)) headers.Referer = job.referer;
+    if (job.cookies && typeof job.cookies === 'string' && job.cookies.length < 4096) headers.Cookie = job.cookies;
     let done = false;
     const finish = (r) => { if (!done) { done = true; resolve(r); } };
     const req = mod.get(job.streamUrl, { headers, timeout: 15000 }, (res) => {
@@ -481,6 +486,7 @@ function startHttpDownload(job, outPath) {
 
   const dlHeaders = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' };
   if (job.referer && /^https?:\/\//i.test(job.referer)) dlHeaders.Referer = job.referer;
+  if (job.cookies && typeof job.cookies === 'string' && job.cookies.length < 4096) dlHeaders.Cookie = job.cookies;
   const req = mod.get(job.streamUrl, {
     headers: dlHeaders,
     timeout: 30000,
@@ -729,9 +735,9 @@ app.post('/api/deep-info', async (req, res) => {
   }
 });
 
-// POST /api/deep-download {streamUrl, type: 'hls'|'mp4', title?, tokenize?, season?, episode?, referer?} -> {job_id}
+// POST /api/deep-download {streamUrl, type: 'hls'|'mp4', title?, tokenize?, season?, episode?, referer?, cookies?} -> {job_id}
 app.post('/api/deep-download', (req, res) => {
-  const { streamUrl, type, title, tokenize, season, episode, referer } = req.body || {};
+  const { streamUrl, type, title, tokenize, season, episode, referer, cookies } = req.body || {};
   if (!validUrl(streamUrl)) return res.status(400).json({ error: 'Bad stream URL.' });
   if (type !== 'hls' && type !== 'mp4') return res.status(400).json({ error: 'Unknown stream type.' });
   const job = newJob({
@@ -741,6 +747,7 @@ app.post('/api/deep-download', (req, res) => {
     title: typeof title === 'string' ? title.slice(0, 200) : null,
     season, episode,
     referer: typeof referer === 'string' && validUrl(referer) ? referer : null,
+    cookies: typeof cookies === 'string' && cookies.length < 4096 ? cookies : null,
     // tokenize: 'vidsrc' — stamp a fresh short-lived token at download time.
     tokenize: tokenize === 'vidsrc' ? 'vidsrc' : null,
   });
