@@ -122,24 +122,38 @@ async function deepFetchOnce(pageUrl) {
 
     // 'commit' returns as soon as the response arrives; 'domcontentloaded' can
     // hang behind slow third-party subresources on these ad-heavy pages.
+    // goto failures are recorded (not swallowed): a refused connection
+    // (ERR_EMPTY_RESPONSE etc.) means the watch page never rendered.
+    let loadError = null;
     await page.goto(pageUrl, { waitUntil: 'commit', timeout: 45000 })
-      .catch(() => {});
+      .catch((e) => { loadError = (e.message || 'navigation failed').split('\n')[0]; });
     // Let the page settle: players lazy-load after JS runs.
     await page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
     await page.waitForTimeout(3000);
 
+    const earlyTitle = await page.title().catch(() => '');
+    // Chromium's network-error page titles itself with the bare hostname
+    // ("www.5movies.cc") — a reliable tell the page never loaded.
+    let watchPage = new URL(pageUrl).hostname.replace(/^www\./, '');
+    const watchLoaded = !loadError && earlyTitle &&
+      earlyTitle.trim().toLowerCase() !== watchPage &&
+      earlyTitle.trim().toLowerCase() !== ('www.' + watchPage);
+
     await harvestVideoTags(page, addCandidate);
 
-    if (found.size === 0) {
-      // 5movies.cc (and lookalikes): the watch page holds an empty
-      // #iframe-embed; its player script POSTs /ajax_tv {id, season, eps,
-      // types} to resolve the real player URL per server (VidPlay,
-      // MovietoPlay, VidEasy). Do the same POSTs from inside the page
-      // (inherits cookies + proxy) and walk each embed until one yields
-      // streams.
-      const embeds = await resolve5moviesEmbeds(page, pageUrl);
+    // 5movies.cc (and lookalikes): the watch page holds an empty
+    // #iframe-embed; its player script POSTs /ajax_tv {id, season, eps,
+    // types} to resolve the real player URL per server (VidPlay,
+    // MovietoPlay, VidEasy). Do the same POSTs from inside the page
+    // (inherits cookies + proxy) and walk each embed until one yields
+    // streams. If the browser couldn't load the watch page at all (or the
+    // in-page POSTs came back empty), fall back to plain-HTTPS resolution
+    // and still walk the embeds in the browser.
+    let embedsTried = 0;
+    const walkEmbeds = async (embeds) => {
       for (const embedUrl of embeds) {
         if (found.size > 0) break;
+        embedsTried++;
         await page.goto(embedUrl, { waitUntil: 'commit', timeout: 45000 }).catch(() => {});
         await page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
         await page.waitForTimeout(3000);
@@ -152,6 +166,12 @@ async function deepFetchOnce(pageUrl) {
           }
         }
       }
+    };
+
+    if (found.size === 0) {
+      let embeds = await resolve5moviesEmbeds(page, pageUrl);
+      if (!embeds.length) embeds = await resolve5moviesEmbedsViaHttp(pageUrl);
+      await walkEmbeds(embeds);
     }
 
     if (found.size === 0) {
@@ -169,10 +189,21 @@ async function deepFetchOnce(pageUrl) {
       return og ? og.getAttribute('content') : null;
     }).catch(() => null);
 
+    // Diagnostics for the "no streams" case: say what actually happened so
+    // the user isn't left guessing (blocked page vs. empty players).
+    let note = null;
+    if (found.size === 0) {
+      const parts = [];
+      parts.push(watchLoaded ? 'watch page loaded' : 'watch page did NOT load in the browser' + (loadError ? ' (' + loadError + ')' : ''));
+      parts.push(embedsTried ? embedsTried + ' player page(s) checked' : 'no player pages could be resolved');
+      note = parts.join('; ') + '.';
+    }
+
     return {
       title: title || 'Deep fetch result',
       thumbnail,
       candidates: rankCandidates([...found.values()]),
+      note,
     };
   } finally {
     await context?.close().catch(() => {});
@@ -208,6 +239,55 @@ async function resolve5moviesEmbeds(page, pageUrl) {
 }
 
 // Pull src/currentSrc from any <video> elements currently in the DOM.
+// Node-side fallback: resolve 5movies player embeds with a plain HTTPS
+// request instead of the headless browser. Some networks/sites refuse the
+// automated browser's connection (empty response) while answering normal
+// HTTPS fine — in that case the watch page never loads in Chromium, but
+// /ajax_tv still hands over the embed URLs and the browser can often still
+// open the player hosts directly.
+async function resolve5moviesEmbedsViaHttp(pageUrl) {
+  if (!/5movies\.cc\/watch/i.test(pageUrl)) return [];
+  const UA_FALLBACK = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
+  try {
+    const watchRes = await fetch(pageUrl, {
+      headers: { 'User-Agent': UA_FALLBACK, 'Accept': 'text/html' },
+      signal: AbortSignal.timeout(30000),
+    });
+    if (!watchRes.ok) return [];
+    const html = await watchRes.text();
+    const tag = (html.match(/<div[^>]*id=['"]datas['"][^>]*>/i) || [])[0];
+    if (!tag) return [];
+    const attr = (n) => (tag.match(new RegExp(n + '=["\']([^"\']*)["\']', 'i')) || [])[1];
+    const id = attr('data-id');
+    if (!id) return [];
+    const season = attr('data-season') || '1';
+    const ep = attr('data-ep') || '1';
+    const types = [...new Set([...html.matchAll(/data-type="([^"]+)"/g)].map((m) => m[1]))];
+    const found = [];
+    for (const t of types) {
+      try {
+        const body = new URLSearchParams({ id, season, eps: ep, types: t });
+        const r = await fetch('https://www.5movies.cc/ajax_tv', {
+          method: 'POST',
+          headers: {
+            'User-Agent': UA_FALLBACK,
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Referer': pageUrl,
+          },
+          body,
+          signal: AbortSignal.timeout(30000),
+        });
+        if (!r.ok) continue;
+        const embedUrl = (await r.text()).trim();
+        if (/^https?:\/\//i.test(embedUrl)) found.push(embedUrl);
+      } catch { /* next server */ }
+    }
+    return found;
+  } catch {
+    return [];
+  }
+}
+
 async function harvestVideoTags(page, addCandidate) {
   const srcs = await page.evaluate(() => {
     const out = [];
