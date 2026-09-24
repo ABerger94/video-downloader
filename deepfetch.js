@@ -205,6 +205,7 @@ async function deepFetchOnce(pageUrl) {
     if (found.size === 0) {
       let embeds = await resolve5moviesEmbeds(page, pageUrl);
       if (!embeds.length) embeds = await resolve5moviesEmbedsViaHttp(pageUrl);
+      if (!embeds.length) embeds = resolve7reelsEmbeds(pageUrl);
       // vidsrc embeds: the direct HTTPS chain beats the browser walk.
       for (const e of embeds) {
         if (found.size || !isVidsrcEmbed(e)) continue;
@@ -278,6 +279,37 @@ async function resolve5moviesEmbeds(page, pageUrl) {
     } catch { /* try next server type */ }
   }
   return out;
+}
+
+// 7reels.cc fast path: the watch page builds its player iframe in JS from
+// third-party embed providers (vidfast/videasy family, in this priority
+// order per the site's own bundle). Construct those embed URLs directly from
+// the watch URL's TMDB id + s/e params so the browser walk below can sniff
+// their streams without depending on the watch page's JS. Pure function —
+// provider URL patterns verified live (HTTP 200, real player pages).
+function resolve7reelsEmbeds(pageUrl) {
+  const m = pageUrl.match(/7reels\.cc\/(tv|movie)\/(\d+)/i);
+  if (!m) return [];
+  const kind = m[1].toLowerCase();
+  const tmdbId = m[2];
+  let season = '1', episode = '1';
+  try {
+    const q = new URL(pageUrl).searchParams;
+    // 7reels uses ?s=&e=; also accept the long forms.
+    season = q.get('s') || q.get('season') || '1';
+    episode = q.get('e') || q.get('episode') || '1';
+  } catch { /* keep defaults */ }
+  const path = kind === 'tv'
+    ? `tv/${tmdbId}/${season}/${episode}`
+    : `movie/${tmdbId}`;
+  const providers = [
+    (p) => `https://vidfast.vc/${p}`,
+    (p) => `https://vidfast.pro/${p}`,
+    (p) => `https://player.videasy.to/${p}`,
+    (p) => `https://vidy.st/${p}`,
+    (p) => `https://vidup.to/${p}`,
+  ];
+  return providers.map((fn) => fn(path));
 }
 
 // Pull src/currentSrc from any <video> elements currently in the DOM.
