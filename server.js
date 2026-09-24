@@ -7,16 +7,24 @@ const { spawn, spawnSync } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
+const http = require('http');
+const https = require('https');
+const { deepFetch } = require('./deepfetch');
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 
 const PORT = process.env.PORT || 3000;
-const DOWNLOADS_DIR = path.join(__dirname, 'downloads');
+// Configurable via DOWNLOAD_DIR (e.g. DOWNLOAD_DIR=E:\videos on Windows).
+// Defaults to ./downloads next to server.js. Everything — yt-dlp output,
+// deep-fetch downloads, the /api/files listing, file serving, DELETE, and
+// the 24h sweep — resolves through this one directory.
+const DOWNLOADS_DIR = path.resolve(process.env.DOWNLOAD_DIR || path.join(__dirname, 'downloads'));
 fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
 
 const MAX_CONCURRENT = 2; // downloads running at once; extras queue
 const MAX_FILESIZE = '2G'; // refuse anything bigger
+const MAX_DEEP_BYTES = 2 * 1024 * 1024 * 1024; // same 2 GB cap for deep-fetch downloads
 const FILE_TTL_MS = 24 * 60 * 60 * 1000; // delete files older than 24h
 const INFO_TIMEOUT_MS = 90000;
 
@@ -97,10 +105,11 @@ function pumpQueue() {
   }
 }
 
-function newJob(url, formatId, title) {
+function newJob({ url, formatId, title, kind = 'ytdlp', streamUrl, streamType }) {
   const id = crypto.randomBytes(8).toString('hex');
   const job = {
-    id, url, formatId, title: title || null,
+    id, url: url || null, formatId: formatId || null, title: title || null,
+    kind, streamUrl: streamUrl || null, streamType: streamType || null,
     status: 'queued', percent: 0, speed: null, eta: null,
     filename: null, error: null, createdAt: Date.now(),
   };
@@ -116,6 +125,7 @@ const RE_ALREADY = /has already been downloaded/;
 const RE_ERROR = /^(?:ERROR|error):\s*(.+)/;
 
 function startDownload(job) {
+  if (job.kind === 'deep') return startDeepDownload(job);
   job.status = 'downloading';
   const outTpl = path.join(DOWNLOADS_DIR, '%(title).80s [%(id)s].%(ext)s');
   const args = [
@@ -201,6 +211,237 @@ function newestFileSince(dir, sinceMs) {
   } catch {
     return null;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Deep downloads: stream URLs sniffed by headless Chromium (deepfetch.js).
+// HLS -> ffmpeg -c copy into mp4; direct mp4 -> streamed HTTP download.
+// ---------------------------------------------------------------------------
+function sanitizeTitle(t) {
+  const s = String(t || 'video').replace(/[^\w.\- ]+/g, '_').trim().slice(0, 80);
+  return s || 'video';
+}
+
+function uniqueOutPath(base) {
+  let p = path.join(DOWNLOADS_DIR, base + '.mp4');
+  if (!fs.existsSync(p)) return p;
+  p = path.join(DOWNLOADS_DIR, base + '-' + Date.now().toString(36) + '.mp4');
+  return p;
+}
+
+function startDeepDownload(job) {
+  job.status = 'downloading';
+  const outPath = uniqueOutPath(sanitizeTitle(job.title));
+  job.filename = path.basename(outPath);
+  if (job.streamType === 'hls') startHlsDownload(job, outPath);
+  else startHttpDownload(job, outPath);
+}
+
+// ffmpeg/ffprobe don't read proxy env vars natively; pass -http_proxy when
+// one is set (no-op in normal deployments like Railway).
+function ffmpegProxyArgs() {
+  const p = process.env.https_proxy || process.env.HTTPS_PROXY ||
+            process.env.http_proxy || process.env.HTTP_PROXY;
+  return p ? ['-http_proxy', p] : [];
+}
+
+// Some HLS proxy URLs (e.g. VidEasy's netocdn proxy) carry required
+// Origin/Referer in a base64 `data` query param:
+//   data=base64("Origin=https://x|Referer=https://x/")
+// Decode it into ffmpeg -headers so the stream server doesn't 403 us.
+function streamHeadersArgs(streamUrl) {
+  try {
+    const data = new URL(streamUrl).searchParams.get('data');
+    if (!data) return [];
+    const decoded = Buffer.from(data, 'base64').toString('utf8');
+    const headers = [];
+    for (const part of decoded.split('|')) {
+      const eq = part.indexOf('=');
+      if (eq > 0) {
+        const k = part.slice(0, eq).trim(), v = part.slice(eq + 1).trim();
+        if (/^(origin|referer)$/i.test(k) && /^https?:\/\//i.test(v)) {
+          headers.push(`${k}: ${v}`);
+        }
+      }
+    }
+    if (!headers.length) return [];
+    return ['-headers', headers.map((h) => h + '\r\n').join('')];
+  } catch {
+    return [];
+  }
+}
+function ffmpegProxyArgs() {
+  const p = process.env.https_proxy || process.env.HTTPS_PROXY ||
+            process.env.http_proxy || process.env.HTTP_PROXY;
+  return p ? ['-http_proxy', p] : [];
+}
+
+function ffprobeDuration(url) {
+  return new Promise((resolve) => {
+    const child = spawn('ffprobe', [
+      '-v', 'error', ...ffmpegProxyArgs(), ...streamHeadersArgs(url),
+      '-show_entries', 'format=duration',
+      '-of', 'default=noprint_wrappers=1:nokey=1', url,
+    ], { timeout: 30000 });
+    let out = '';
+    child.stdout.on('data', (c) => { out += c; });
+    child.on('close', () => {
+      const d = parseFloat(out.trim());
+      resolve(Number.isFinite(d) && d > 0 ? d : null);
+    });
+    child.on('error', () => resolve(null));
+  });
+}
+
+const RE_FFMPEG_TIME = /time=(\d+):(\d+):([\d.]+)/;
+
+async function startHlsDownload(job, outPath) {
+  const duration = await ffprobeDuration(job.streamUrl);
+  const args = [
+    '-hide_banner', '-y',
+    ...ffmpegProxyArgs(),
+    ...streamHeadersArgs(job.streamUrl),
+    '-rw_timeout', '15000000', // 15s stall timeout (microseconds)
+    '-i', job.streamUrl,
+    '-c', 'copy', '-bsf:a', 'aac_adtstoasc',
+    outPath,
+  ];
+  const child = spawn('ffmpeg', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+  let buf = '', lastError = null, tooBig = false;
+
+  // HLS has no reliable upfront size: watch the growing file and kill ffmpeg
+  // if it crosses the 2 GB cap.
+  const sizeWatch = setInterval(() => {
+    try {
+      if (fs.statSync(outPath).size > MAX_DEEP_BYTES) {
+        tooBig = true;
+        child.kill('SIGKILL');
+      }
+    } catch { /* file may not exist yet */ }
+  }, 5000);
+
+  child.stderr.on('data', (chunk) => {
+    buf += chunk.toString();
+    let idx;
+    while ((idx = buf.indexOf('\r')) >= 0 || (idx = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, idx).trim();
+      buf = buf.slice(idx + 1);
+      const m = line.match(RE_FFMPEG_TIME);
+      if (m && duration) {
+        const t = parseInt(m[1], 10) * 3600 + parseInt(m[2], 10) * 60 + parseFloat(m[3]);
+        job.percent = Math.min(99, (t / duration) * 100);
+        job.speed = 'stream copy';
+        job.eta = null;
+      } else if (/error|failed|invalid/i.test(line) && !/^\s*$/.test(line)) {
+        lastError = line.slice(0, 300);
+      }
+    }
+  });
+  child.on('error', (err) => {
+    clearInterval(sizeWatch);
+    job.status = 'error';
+    job.error = 'Could not launch ffmpeg: ' + err.message;
+    pumpQueue();
+  });
+  child.on('close', (code) => {
+    clearInterval(sizeWatch);
+    if (tooBig) {
+      job.status = 'error';
+      job.error = 'Stream exceeds the 2 GB limit.';
+      try { fs.unlinkSync(outPath); } catch { /* ignore partial */ }
+    } else if (code === 0 && fs.existsSync(outPath)) {
+      job.status = 'done';
+      job.percent = 100;
+      job.speed = null;
+    } else {
+      job.status = 'error';
+      job.error = lastError || ('ffmpeg exited with code ' + code);
+      try { fs.unlinkSync(outPath); } catch { /* ignore partial */ }
+    }
+    pumpQueue();
+  });
+}
+
+function startHttpDownload(job, outPath) {
+  const mod = job.streamUrl.startsWith('https:') ? https : http;
+  const file = fs.createWriteStream(outPath);
+  const started = Date.now();
+  let received = 0, total = null, lastTick = 0;
+
+  const fail = (msg) => {
+    if (job.status === 'error' || job.status === 'done') return; // idempotent
+    try { file.destroy(); } catch { /* ignore */ }
+    try { fs.unlinkSync(outPath); } catch { /* ignore */ }
+    job.status = 'error';
+    job.error = msg;
+    pumpQueue();
+  };
+
+  const req = mod.get(job.streamUrl, {
+    headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
+    timeout: 30000,
+  }, (res) => {
+    // Follow one redirect level (CDNs love these).
+    if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+      res.resume();
+      job.streamUrl = new URL(res.headers.location, job.streamUrl).toString();
+      file.close();
+      try { fs.unlinkSync(outPath); } catch { /* ignore */ }
+      return startHttpDownload(job, outPath);
+    }
+    if (res.statusCode !== 200) {
+      res.resume();
+      return fail('Stream server returned HTTP ' + res.statusCode);
+    }
+    const len = parseInt(res.headers['content-length'], 10);
+    if (Number.isFinite(len) && len > 0) total = len;
+    if (Number.isFinite(len) && len > MAX_DEEP_BYTES) {
+      res.resume();
+      return fail('Stream exceeds the 2 GB limit.');
+    }
+
+    res.on('data', (chunk) => {
+      received += chunk.length;
+      if (received > MAX_DEEP_BYTES) {
+        req.destroy();
+        return fail('Stream exceeds the 2 GB limit.');
+      }
+      const now = Date.now();
+      if (now - lastTick < 250) return;
+      lastTick = now;
+      const elapsed = Math.max(0.1, (now - started) / 1000);
+      const bps = received / elapsed;
+      job.speed = fmtBytes(bps) + '/s';
+      if (total) {
+        job.percent = Math.min(99, (received / total) * 100);
+        const remain = total - received;
+        job.eta = bps > 0 ? fmtEta(remain / bps) : null;
+      } else {
+        job.percent = 0;
+        job.eta = null;
+      }
+    });
+    res.on('end', () => {
+      file.end(() => {
+        job.status = 'done';
+        job.percent = 100;
+        job.speed = null;
+        job.eta = null;
+        pumpQueue();
+      });
+    });
+    res.on('error', (e) => fail('Download interrupted: ' + e.message));
+    res.pipe(file);
+  });
+  req.on('timeout', () => { req.destroy(new Error('connection timed out')); });
+  req.on('error', (e) => fail('Could not reach stream: ' + e.message));
+}
+
+function fmtEta(sec) {
+  sec = Math.round(sec);
+  if (!Number.isFinite(sec) || sec < 0) return null;
+  const m = Math.floor(sec / 60), s = sec % 60;
+  return (m > 0 ? m + 'm ' : '') + s + 's';
 }
 
 // ---------------------------------------------------------------------------
@@ -291,7 +532,40 @@ app.post('/api/download', (req, res) => {
   if (!format_id || typeof format_id !== 'string' || !/^[A-Za-z0-9_+\-\[\]().,= ]+$/.test(format_id)) {
     return res.status(400).json({ error: 'Pick a quality first.' });
   }
-  const job = newJob(url, format_id.trim(), typeof title === 'string' ? title.slice(0, 200) : null);
+  const job = newJob({
+    url,
+    formatId: format_id.trim(),
+    title: typeof title === 'string' ? title.slice(0, 200) : null,
+  });
+  res.json({ job_id: job.id, status: job.status });
+});
+
+// POST /api/deep-info {url} -> render the page in headless Chromium and sniff stream URLs
+app.post('/api/deep-info', async (req, res) => {
+  const { url } = req.body || {};
+  if (!validUrl(url)) return res.status(400).json({ error: 'Give me a valid http(s) URL.' });
+  try {
+    const result = await deepFetch(url);
+    if (!result.candidates.length) {
+      return res.status(422).json({ error: 'Deep fetch found no playable streams on that page.' });
+    }
+    res.json(result);
+  } catch (e) {
+    res.status(500).json({ error: 'Deep fetch failed: ' + (e.message || 'browser error') });
+  }
+});
+
+// POST /api/deep-download {streamUrl, type: 'hls'|'mp4', title?} -> {job_id}
+app.post('/api/deep-download', (req, res) => {
+  const { streamUrl, type, title } = req.body || {};
+  if (!validUrl(streamUrl)) return res.status(400).json({ error: 'Bad stream URL.' });
+  if (type !== 'hls' && type !== 'mp4') return res.status(400).json({ error: 'Unknown stream type.' });
+  const job = newJob({
+    kind: 'deep',
+    streamUrl,
+    streamType: type,
+    title: typeof title === 'string' ? title.slice(0, 200) : null,
+  });
   res.json({ job_id: job.id, status: job.status });
 });
 
